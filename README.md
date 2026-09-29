@@ -1,0 +1,2 @@
+# GoMCTS
+MCTS Go Engine
