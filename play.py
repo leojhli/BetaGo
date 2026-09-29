@@ -1,10 +1,12 @@
-"""Local two-player Go board. Run with: python play.py"""
+"""Visual Go board. Run python play.py, or python play.py --random --seed 10."""
 
+import argparse
 import tkinter as tk
 import math
 import random
 from tkinter import ttk
 
+from agents import RandomAgent
 from game import BLACK, EMPTY, PASS, WHITE, GameState, IllegalMove
 
 
@@ -13,13 +15,21 @@ class GoWindow:
     SPACING = 58
     DEMO = ((0, 1), (1, 1), (1, 0), (8, 8), (2, 1), (8, 7), (1, 2))
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, *, seed=0, max_moves=500, delay_ms=500):
+        if max_moves < 1 or delay_ms < 1:
+            raise ValueError("Move limit and delay must be positive")
         self.root = root
         self.state = GameState.new()
         self.history = []
         self.last_move = None
         self.demo_job = None
         self.demo_index = 0
+        self.random_job = None
+        self.random_agents = {}
+        self.random_truncated = False
+        self.seed = seed
+        self.max_moves = max_moves
+        self.delay_ms = delay_ms
         root.title("BetaGo - 9x9 Go")
         root.resizable(False, False)
         root.configure(background="#202321")
@@ -36,7 +46,8 @@ class GoWindow:
         panel = ttk.Frame(root, padding=20)
         panel.pack(fill="both", expand=True)
         ttk.Label(panel, text="BetaGo", font=("Segoe UI", 24, "bold")).pack(anchor="w")
-        ttk.Label(panel, text="9 x 9   /   Local play   /   Komi 7.5",
+        self.mode = tk.StringVar(value="9 x 9   /   Local play   /   Komi 7.5")
+        ttk.Label(panel, textvariable=self.mode,
                   foreground="#aeb7aa").pack(anchor="w", pady=(0, 16))
         side = 2 * self.MARGIN + 8 * self.SPACING
         self.canvas = tk.Canvas(panel, width=side, height=side,
@@ -57,6 +68,11 @@ class GoWindow:
         ttk.Button(buttons, text="New game", command=self.new_game).pack(side="left")
         self.demo_button = ttk.Button(buttons, text="Watch capture demo", command=self.toggle_demo)
         self.demo_button.pack(side="right")
+        watch_controls = ttk.Frame(panel)
+        watch_controls.pack(fill="x", pady=(8, 0))
+        self.random_button = ttk.Button(watch_controls, text="Watch random game",
+                                        command=self.toggle_random)
+        self.random_button.pack(side="left")
         ttk.Label(panel, text="Finish captures before passing. Remaining stones count toward area.",
                   wraplength=540).pack(anchor="w", pady=(12, 0))
         self.draw()
@@ -142,15 +158,18 @@ class GoWindow:
             winner = self.state.winner()
             result = "Draw" if winner is None else ("Black wins" if winner == BLACK else "White wins")
             self.status.set(f"{result}  |  Black {score.black:g} - White {score.white:g}")
+        elif self.random_truncated:
+            self.status.set(f"Truncated at {len(self.history)} moves  |  No final score")
         else:
             player = "Black" if self.state.to_play == BLACK else "White"
             self.status.set(f"{player} to play  |  Move {len(self.history) + 1}  |  Passes {self.state.consecutive_passes}/2")
-        self.pass_button.configure(state="disabled" if self.state.is_terminal() or self.demo_job else "normal")
+        watching = self.demo_job is not None or self.random_job is not None
+        self.pass_button.configure(state="disabled" if self.state.is_terminal() or watching else "normal")
         self.undo_button.configure(state="normal" if self.history else "disabled")
 
     def click(self, event):
-        if self.demo_job is not None:
-            self.notice.set("Stop the demo to play your own moves.")
+        if self.demo_job is not None or self.random_job is not None:
+            self.notice.set("Stop playback to play your own moves.")
             return
         column = round((event.x - self.MARGIN) / self.SPACING)
         row = round((event.y - self.MARGIN) / self.SPACING)
@@ -171,6 +190,7 @@ class GoWindow:
             row.count(opponent) for row in successor.board)
         self.history.append((self.state, self.last_move))
         self.state = successor
+        self.random_truncated = False
         self.last_move = move
         if self.state.is_terminal():
             self.notice.set("Game over after two passes. Undo to resume, or start a new game.")
@@ -178,6 +198,8 @@ class GoWindow:
             self.notice.set("Passed. Another pass will end the game.")
         elif captured:
             self.notice.set(f"Captured {captured} stone(s). The empty intersections can be played again.")
+        elif self.random_job is not None:
+            self.notice.set("Random agents are choosing legal moves, including pass.")
         else:
             self.notice.set("Click an intersection to place a stone.")
         self.draw()
@@ -190,14 +212,18 @@ class GoWindow:
 
     def new_game(self):
         self.stop_demo()
+        self.stop_random()
         self.state = GameState.new()
         self.history.clear()
         self.last_move = None
+        self.random_truncated = False
         self.notice.set("Click an intersection to place a stone.")
         self.draw()
 
     def undo(self):
         self.stop_demo()
+        self.stop_random()
+        self.random_truncated = False
         if self.history:
             self.state, self.last_move = self.history.pop()
             self.notice.set("Move undone.")
@@ -227,12 +253,64 @@ class GoWindow:
             self.demo_job = self.root.after(900, self.demo_step)
         self.draw()
 
+    def stop_random(self):
+        if self.random_job is not None:
+            self.root.after_cancel(self.random_job)
+            self.random_job = None
+        self.random_button.configure(text="Watch random game")
+        self.mode.set("9 x 9   /   Local play   /   Komi 7.5")
+
+    def toggle_random(self):
+        if self.random_job is not None:
+            self.stop_random()
+            self.notice.set("Random game stopped. You can continue playing this position.")
+            self.draw()
+            return
+        self.new_game()
+        self.random_agents = {BLACK: RandomAgent(self.seed), WHITE: RandomAgent(self.seed + 1)}
+        self.mode.set(f"9 x 9   /   Random vs random   /   Seed {self.seed}   /   Komi 7.5")
+        self.random_button.configure(text="Stop random game")
+        self.notice.set("Watch the random agents play. Stop playback to take over.")
+        self.random_job = self.root.after(self.delay_ms, self.random_step)
+        self.draw()
+
+    def random_step(self):
+        """Advance one legal action, then let Tkinter handle input and drawing."""
+        move = self.random_agents[self.state.to_play].choose_move(self.state)
+        self.play(move)
+        if self.state.is_terminal():
+            self.stop_random()
+            self.mode.set("9 x 9   /   Random game finished   /   Komi 7.5")
+        elif len(self.history) >= self.max_moves:
+            self.stop_random()
+            self.random_truncated = True
+            self.mode.set("9 x 9   /   Random game truncated   /   Komi 7.5")
+            self.notice.set("Move limit reached. No final score. Continue playing or start a new game.")
+        else:
+            self.random_job = self.root.after(self.delay_ms, self.random_step)
+        self.draw()
+
     def close(self):
         self.stop_demo()
+        self.stop_random()
         self.root.destroy()
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--random", action="store_true", help="Start watching random agents immediately")
+    parser.add_argument("--seed", type=int, default=0, help="Black's seed; White uses seed + 1")
+    parser.add_argument("--max-moves", type=int, default=500)
+    parser.add_argument("--delay-ms", type=int, default=500, help="Delay between random moves in milliseconds")
+    args = parser.parse_args(argv)
+    if args.max_moves < 1 or args.delay_ms < 1:
+        parser.error("Move limit and delay must be positive")
     root = tk.Tk()
-    GoWindow(root)
+    window = GoWindow(root, seed=args.seed, max_moves=args.max_moves, delay_ms=args.delay_ms)
+    if args.random:
+        window.toggle_random()
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -6,7 +6,7 @@ and area scoring.
 The long-term goal is a small self-learning Go engine inspired by
 [KataGo](https://github.com/lightvector/KataGo), using neural-guided search and
 self-play in Python. Currently, the project provides the rules engine and a
-local two-player interface.
+local two-player interface, plus a seeded random agent and a batch game runner.
 
 ## Play on screen
 
@@ -23,7 +23,73 @@ The wooden board includes coordinates on all four sides and shaded stones.
 white stone being captured. You can stop it at any time and continue playing.
 This is a demonstration, not a computer opponent.
 
+**Watch random game** starts a new game with the two seeded random agents.
+Stones appear one move at a time. **Stop random game**, **Undo**, and **New game**
+stop playback; after stopping, you can continue the position yourself.
+Start random playback directly with:
+
+```powershell
+python play.py --random --seed 10
+```
+
+Use `--delay-ms 250` for faster playback or `--max-moves 100` to set a shorter
+limit. The visual board remains 9x9. With the same seed and limit, it plays the
+same moves as the first 9x9 game in the terminal runner. It displays the winner
+after two passes, or a truncation message without a score at the move limit.
+Visual playback does not save a JSON record.
+
 The window uses Tkinter, included with the standard Windows Python installer.
+
+## Run random games
+
+These commands run batches and replay final boards in the terminal. For animated
+playback in a window, use `python play.py --random --seed 10` above.
+Start with small boards, then try 9x9:
+
+```powershell
+python runner.py --size 3 --games 5 --seed 10 --max-moves 100 --output results/tiny.json
+python runner.py --size 9 --games 3 --seed 10 --max-moves 500 --output results/9x9.json
+python runner.py --replay results/tiny.json
+```
+
+Both players pick uniformly from all legal actions, including pass. This is a
+baseline for experiments, with no tactical judgment. The on-screen interface
+can show random play, local two-player play, and the scripted capture demonstration.
+
+Each JSON game records its board size, komi, move limit, both player seeds,
+moves, game length (including passes), elapsed seconds, termination reason,
+score, and winner. Placements are `[row, column]`; pass is `null`. Winner uses
+`1` for Black, `2` for White, and `null` for a draw in a completed game.
+Two consecutive passes produce `two_passes`; reaching the action limit first
+produces `move_limit`. Truncated games have `null` score and winner. They are
+unfinished, with no final outcome. A second pass on the last allowed action
+still counts as a completed game.
+
+The batch seed assigns Black `seed + 2 * game_index` and White the next integer,
+with game indices starting at zero. Repeating the command reproduces moves and
+outcomes with the same code and Python version; runtime varies. The output file
+is overwritten on each run, so use distinct paths to keep experiments. Generated
+`results/` files are ignored by Git. Replay checks legality and recorded outcomes
+and prints each final board; it does not need randomness.
+
+You can also use the agent and runner directly:
+
+```python
+from agents import RandomAgent
+from runner import run_game, replay_moves
+
+result = run_game(RandomAgent(10), RandomAgent(11), size=3, max_moves=100)
+print(result.termination_reason, result.score)
+assert replay_moves(result.moves, size=3) == result.final_state
+```
+
+An agent implements `choose_move(state)`. The runner selects the current
+player's agent, applies its choice through `GameState.play`, and records the
+action. Each random agent owns a `random.Random` generator, so players do not
+share or alter global random state. Recreate the agents to restart their seeds.
+Illegal agent moves raise `IllegalMove`; choosing from a terminal state raises
+`ValueError`. Random games help check integration and state invariants; they do
+not establish scoring correctness or playing strength.
 
 ## Run the tests
 
@@ -86,6 +152,10 @@ shape and values, not whether the position could arise through legal play.
 4. Read pass handling, `score`, and `winner`.
 5. [tests/test_game.py](tests/test_game.py) covers rules using small board diagrams.
 6. [play.py](play.py) draws the board and routes clicks through the rules engine.
+7. [agents/random_agent.py](agents/random_agent.py) samples the legal action list.
+8. [runner.py](runner.py) alternates agents, records games, and replays moves.
+9. [tests/test_runner.py](tests/test_runner.py) checks reproducibility, legal play,
+   state invariants, truncation, and saved records.
 
 Boards are tuples of tuples. A move temporarily uses mutable rows, then freezes
 the result. This keeps parent and sibling states independent for future MCTS.
