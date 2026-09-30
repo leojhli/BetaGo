@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
                 if (index < 0 || static_cast<std::size_t>(index) >= examples.size())
                     throw std::invalid_argument("Example index is out of bounds");
                 show_prediction(network, examples[index].input);
-                std::cout << "Scripted target value: " << examples[index].value << '\n';
+                std::cout << "Dataset target value: " << examples[index].value << '\n';
             } else show_prediction(network, encode_position(GameState::new_game(network.settings().board_size, args.real("--komi", 7.5))));
             return 0;
         }

@@ -1,4 +1,5 @@
 #include "betago/neural_mcts.hpp"
+#include "betago/profile.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -50,6 +51,7 @@ Node::Node(GameState position, Move move, Node* parent_node, double move_prior)
 }
 
 std::vector<double> normalize_priors(const GameState& state, const Prediction& prediction) {
+    ProfileScope scope(ProfileWork::Normalize);
     const auto action_count = static_cast<std::size_t>(state.size() * state.size() + 1);
     if (prediction.policy.size() != action_count)
         throw std::invalid_argument("Neural policy action count does not match the board");
@@ -160,6 +162,7 @@ NeuralMctsSearch::NeuralMctsSearch(const GameState& state, NeuralMctsSettings se
 }
 
 double NeuralMctsSearch::evaluate_and_expand(neural_mcts_detail::Node& node) {
+    ProfileScope scope(ProfileWork::Expand);
     if (node.state.is_terminal()) {
         const double value = mcts_detail::terminal_value(node.state, node.state.to_play());
         ++terminal_evaluations_;
@@ -180,6 +183,7 @@ double NeuralMctsSearch::evaluate_and_expand(neural_mcts_detail::Node& node) {
 }
 
 void NeuralMctsSearch::simulate() {
+    ProfileScope scope(ProfileWork::Simulation);
     auto* leaf = root_.get();
     while (!leaf->state.is_terminal() && leaf->expanded)
         leaf = &neural_mcts_detail::select_child(*leaf, settings_.c_puct);

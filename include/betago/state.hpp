@@ -62,6 +62,11 @@ public:
     bool operator==(const GameState&) const = default;
 
 private:
+    struct SuccessorTag {};
+    // Only play can use this path: the source position is already validated,
+    // and captures/placements preserve its shape and allowed cell values.
+    GameState(Board board, int to_play, double komi, int consecutive_passes,
+              std::optional<Board> previous_board, SuccessorTag);
     Board board_;
     int to_play_, consecutive_passes_;
     double komi_;

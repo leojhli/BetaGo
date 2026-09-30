@@ -12,6 +12,8 @@ int run_arena_tests();
 int run_neural_tests();
 int run_neural_mcts_tests();
 int run_neural_arena_tests();
+int run_selfplay_tests();
+int run_performance_tests();
 
 void check(bool condition, const std::string& message = "Unexpected result") {
     if (!condition) throw std::runtime_error(message);
@@ -283,5 +285,7 @@ int main(int argc, char** argv) {
     int neural_failures = run_neural_tests();
     int puct_failures = run_neural_mcts_tests();
     int neural_arena_failures = run_neural_arena_tests();
-    return suite.failed || search_failures || arena_failures || neural_failures || puct_failures || neural_arena_failures ? 1 : 0;
+    int selfplay_failures = run_selfplay_tests();
+    int performance_failures = run_performance_tests();
+    return suite.failed || search_failures || arena_failures || neural_failures || puct_failures || neural_arena_failures || selfplay_failures || performance_failures ? 1 : 0;
 }

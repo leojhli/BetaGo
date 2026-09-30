@@ -1,10 +1,69 @@
 #include "betago/state.hpp"
+#include "betago/profile.hpp"
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <utility>
 
 namespace betago {
+namespace {
+// Internal move checks need only to find a liberty, or collect a group that
+// has none. They do not need the sorted sets returned by the public Group API.
+struct LibertyScratch {
+    std::vector<unsigned char> marks;
+    std::vector<Point> stones;
+    unsigned char generation = 0;
+};
+
+template<class Function>
+bool any_neighbor(Point point, int size, Function function) {
+    return (point.row > 0 && function(Point{point.row - 1, point.column}))
+        || (point.row + 1 < size && function(Point{point.row + 1, point.column}))
+        || (point.column > 0 && function(Point{point.row, point.column - 1}))
+        || (point.column + 1 < size && function(Point{point.row, point.column + 1}));
+}
+
+bool has_liberty(const Board& board, Point start, LibertyScratch& scratch) {
+    ProfileScope scope(ProfileWork::Group);
+    const int size = static_cast<int>(board.size());
+    scratch.stones.clear();
+    // Most candidate stones/groups already have an adjacent liberty. Avoid
+    // allocating traversal buffers when that direct check settles the result.
+    if (any_neighbor(start, size, [&](Point point) {
+        return board[point.row][point.column] == EMPTY;
+    })) return true;
+
+    if (scratch.marks.empty()) {
+        scratch.marks.resize(static_cast<std::size_t>(size) * size, 0);
+        scratch.stones.reserve(static_cast<std::size_t>(size));
+    }
+    // One placement checks at most four adjacent opponent groups and its own
+    // group, so the byte generation cannot overflow within this scratch object.
+    const unsigned char generation = ++scratch.generation;
+    const int color = board[start.row][start.column];
+    auto index = [size](Point point) {
+        return static_cast<std::size_t>(point.row) * size + point.column;
+    };
+    scratch.marks[index(start)] = generation;
+    scratch.stones.push_back(start);
+    for (std::size_t cursor = 0; cursor < scratch.stones.size(); ++cursor) {
+        const Point current = scratch.stones[cursor];
+        if (any_neighbor(current, size, [&](Point point) {
+            const int neighbor_color = board[point.row][point.column];
+            if (neighbor_color == EMPTY) return true;
+            const auto at = index(point);
+            if (neighbor_color == color && scratch.marks[at] != generation) {
+                scratch.marks[at] = generation;
+                scratch.stones.push_back(point);
+            }
+            return false;
+        })) return true;
+    }
+    return false;
+}
+} // namespace
+
 std::optional<int> Score::winner() const {
     if (black == white) return std::nullopt;
     return black > white ? BLACK : WHITE;
@@ -34,6 +93,11 @@ GameState::GameState(Board board, int to_play, double komi, int passes,
     if (passes < 0 || passes > 2) throw std::invalid_argument("Consecutive passes must be 0, 1, or 2");
     if (!std::isfinite(komi)) throw std::invalid_argument("Komi must be finite");
 }
+
+GameState::GameState(Board board, int to_play, double komi, int passes,
+                     std::optional<Board> previous, SuccessorTag)
+    : board_(std::move(board)), to_play_(to_play), consecutive_passes_(passes),
+      komi_(komi), previous_board_(std::move(previous)) {}
 
 GameState GameState::new_game(int size, double komi) {
     if (size < 1) throw std::invalid_argument("Board size must be a positive integer");
@@ -70,6 +134,7 @@ std::set<Point> GameState::region(Point p) const {
 }
 
 Group GameState::group_and_liberties(Point p) const {
+    ProfileScope scope(ProfileWork::Group);
     if (at(p) == EMPTY) throw std::invalid_argument("A group must start at a stone");
     Group group{region(p), {}};
     for (Point stone : group.stones)
@@ -79,6 +144,7 @@ Group GameState::group_and_liberties(Point p) const {
 }
 
 GameState GameState::play(Move move) const {
+    ProfileScope scope(ProfileWork::StatePlay);
     if (is_terminal()) throw IllegalMove("The game has ended");
     int opponent = to_play_ == BLACK ? WHITE : BLACK;
     if (!move) return GameState(board_, opponent, komi_, consecutive_passes_ + 1, board_);
@@ -86,26 +152,34 @@ GameState GameState::play(Move move) const {
         if (at(*move) != EMPTY) throw IllegalMove("The intersection is occupied");
     } catch (const std::invalid_argument& error) { throw IllegalMove(error.what()); }
 
-    GameState result = *this;
+    // Copy only the current board and its required one-ply history. Cloning the
+    // source's older history would allocate a board that is immediately replaced.
+    // This narrow profile scope excludes pass and ordinary caller construction.
+    GameState result = [&] {
+        ProfileScope copy_scope(ProfileWork::StateCopy);
+        return GameState(board_, opponent, komi_, 0, board_, SuccessorTag{});
+    }();
     result.board_[move->row][move->column] = to_play_;
-    std::set<Point> captured;
-    for (Point q : neighbors(*move)) {
-        if (result.at(q) == opponent) {
-            Group group = result.group_and_liberties(q);
-            if (group.liberties.empty()) captured.insert(group.stones.begin(), group.stones.end());
+    LibertyScratch scratch;
+    std::vector<Point> captured;
+    any_neighbor(*move, size(), [&](Point point) {
+        if (result.board_[point.row][point.column] == opponent
+            && std::find(captured.begin(), captured.end(), point) == captured.end()
+            && !has_liberty(result.board_, point, scratch)) {
+            captured.insert(captured.end(), scratch.stones.begin(), scratch.stones.end());
         }
-    }
+        // Inspect every adjacent group before removing any captured stones.
+        return false;
+    });
     for (Point p : captured) result.board_[p.row][p.column] = EMPTY;
-    if (result.group_and_liberties(*move).liberties.empty()) throw IllegalMove("Suicide is forbidden");
+    if (!has_liberty(result.board_, *move, scratch)) throw IllegalMove("Suicide is forbidden");
     if (previous_board_ && result.board_ == *previous_board_)
         throw KoViolation("Simple ko forbids immediate board repetition");
-    result.to_play_ = opponent;
-    result.consecutive_passes_ = 0;
-    result.previous_board_ = board_;
     return result;
 }
 
 std::vector<Move> GameState::legal_moves() const {
+    ProfileScope scope(ProfileWork::LegalMoves);
     std::vector<Move> moves;
     if (is_terminal()) return moves;
     for (int r = 0; r < size(); ++r) for (int c = 0; c < size(); ++c) {

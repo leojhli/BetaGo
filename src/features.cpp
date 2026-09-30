@@ -1,4 +1,5 @@
 #include "betago/features.hpp"
+#include "betago/profile.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -47,6 +48,7 @@ void EncodedPosition::validate() const {
 }
 
 EncodedPosition encode_position(const GameState& state) {
+    ProfileScope scope(ProfileWork::Encode);
     validate_size(state.size());
     const int area = state.size() * state.size();
     EncodedPosition result{state.size(), std::vector<double>(FEATURE_CHANNELS * area, 0.0),

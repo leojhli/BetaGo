@@ -6,7 +6,8 @@ search (MCTS). The long-term goal is a small self-learning Go engine inspired by
 [KataGo](https://github.com/lightvector/KataGo).
 Currently it provides the rules environment, random and MCTS play, game
 recording, search statistics, an arena for repeatable agent comparisons, a
-small CPU policy/value network, and neural MCTS guided by its policy and value.
+small CPU policy/value network, neural MCTS guided by its policy and value,
+and a resumable self-play training loop with checkpoint evaluation and native performance profiling.
 
 ## Build
 
@@ -17,10 +18,15 @@ On this Windows machine, run from the repository root:
 ```
 
 The script builds optimized `build/play.exe`, `build/runner.exe`,
-`build/network.exe`, and `build/tests.exe`. On its first run it downloads a pinned portable C++ compiler
+`build/network.exe`, `build/selfplay.exe`, `build/profile.exe`, and `build/tests.exe`. On its first run it downloads a pinned portable C++ compiler
 into `.tools/` and verifies the archive's checksum. Nothing is installed globally.
 Later builds reuse the compiler and unchanged object files. Use `-DebugBuild`
 for an unoptimized build with debug information.
+
+Windows Smart App Control can block locally built unsigned executables even
+after compilation succeeds. A trusted signed build or an appropriate Windows
+development environment is then needed to launch them. See Microsoft's
+[Smart App Control signing guidance](https://learn.microsoft.com/en-us/windows/apps/develop/smart-app-control/code-signing-for-smart-app-control).
 
 The visual board uses the same Tk 8.6 toolkit as the original interface, directly
 from C++. The build copies the Tk libraries from the local `.tools/tk/` cache
@@ -222,8 +228,8 @@ and C++ standard. It also records the run timestamp, host name, OS family,
 architecture, available CPU identifier, and hardware-thread count. Unavailable
 machine and Git values are `null`. Keep this metadata with comparison results
 so later changes to code or machines are visible. The arena evaluates random,
-classical MCTS, direct policy, and neural MCTS agents. The network is trained
-separately; self-play reinforcement learning remains future work.
+classical MCTS, direct policy, and neural MCTS agents. The self-play command
+coordinates game generation, network training and this checkpoint evaluation.
 
 ## Train the policy/value network
 
@@ -360,9 +366,10 @@ unfinished games. The demo checkpoint memorized nine scripted examples and
 has no broad training. Neural search is therefore a functional foundation,
 without an established playing-strength improvement. Equal simulation counts
 also represent different work for random rollouts and network evaluations.
-The existing complete-pair uncertainty bounds and color exchange still apply.
-Self-play generation, exploration noise, training on search visits, and candidate
-checkpoint promotion are not implemented yet.
+Color exchange still applies. The generic arena's uncertainty formula assumes
+independent seed pairs; deterministic neural comparisons repeat the same games
+across pairs and do not meet that assumption. The self-play loop reports null
+intervals for these comparisons and saves its candidate promotion decision.
 
 `--checkpoint` supplies a model to neural agents without an explicit override.
 Normal batches can use `--black-checkpoint` and `--white-checkpoint`; the arena
@@ -408,9 +415,181 @@ Final move selection uses the most visits, then the largest prior, then legal
 row-major order with pass last. Selection score ties use that same legal order.
 Inference and search are deterministic for a fixed checkpoint and settings;
 identity seeds continue to control random agents and classical MCTS. There is
-no self-play noise or temperature sampling. All-zero legal policy weights fall
+no noise or temperature sampling in these evaluation agents. Self-play has
+separate exploration settings described below. All-zero legal policy weights fall
 back to uniform legal priors; invalid shapes, negative/nonfinite weights, and
 out-of-range values are rejected.
+
+## Learn through self-play
+
+Run a first 9x9 iteration from a fresh seeded network, then open the accepted
+checkpoint in the same visual board:
+
+```powershell
+.\build\selfplay.exe --output results/selfplay --iterations 1
+.\build\play.exe --neural --checkpoint results/selfplay/best.json
+```
+
+Training runs in the console and writes checkpoints; `play.exe` displays the
+board. The wooden board, shaded stones, coordinates and controls stay the same.
+The GUI loads a checkpoint when it starts; reopen it to use a later checkpoint.
+For more iterations, restore the run's settings, replay and accepted model:
+
+```powershell
+.\build\selfplay.exe --resume results/selfplay --iterations 10
+```
+
+A new run requires a new output directory. `--checkpoint MODEL` starts from an
+existing network, including its optimizer history, rather than initializing
+weights again. Its board dimensions must match self-play; it supplies the
+architecture. Resume accepts only `--iterations`; to change settings, start a
+new output directory with the desired checkpoint. Each iteration uses recorded
+separate seeds for game sampling, minibatches and arena identities. Checkpoint
+and replay fingerprints detect changed committed inputs; they are content
+identifiers, not cryptographic authentication.
+
+The default iteration generates four games with 64 PUCT simulations per move,
+komi 7.5 and a 200-move limit. Each pre-action state saves a policy target
+`pi[a] = root_visits[a] / simulations`, including pass. Illegal actions have
+zero mass. The actual move is sampled from `pi[a]^(1/temperature)` during the
+first 20 moves, at temperature 1 by default; subsequent moves use the regular
+maximum-visit choice. Setting temperature to zero or temperature-moves to zero
+selects maximum visits throughout. Temperature affects action selection, while
+training targets always retain the raw normalized visits.
+
+Self-play also mixes each root's legal neural priors with 25% uniform legal
+probability by default. This is a simple exploration floor, not Dirichlet
+noise. It applies only to the root of each self-play search, without changing
+leaf values or evaluation search. `--root-uniform-mix 0` disables it.
+`--simulations`, `--c-puct`, `--temperature`, `--temperature-moves`,
+`--root-uniform-mix` and `--max-moves` control these choices.
+
+After two passes end a game, every saved state's value target is +1 if its
+player to move won, -1 if that player lost, or 0 for a genuine draw. Move-limit
+games retain their moves and visit statistics for inspection but provide no
+training examples. There is no resignation, forced pass, or guessed terminal
+value. If all games truncate and the replay is empty, the iteration records a
+skip, leaves the checkpoint unchanged, and the command exits 2. A later
+iteration can try again. When older completed games exist, training can use
+that replay even if the current batch produced no new complete games.
+
+The replay keeps the most recent 100 **whole completed games**, removing the
+oldest first; `--replay-games` changes that limit. The trainer samples positions
+uniformly with replacement, so longer games contribute more positions. Each
+candidate continues the accepted model's weights and momentum, takes 100
+updates of 32 examples, and uses SGD with learning rate 0.01, momentum 0.9 and
+L2 coefficient 0.0001. These have `--updates`, `--batch-size`, `--learning-rate`,
+`--momentum` and `--l2` options. Failed candidates do not change the accepted
+model's optimizer state.
+
+The objective is mean policy cross-entropy plus mean squared value error plus
+`0.5 * l2 * sum(parameters^2)`, including biases. Cross-entropy teaches the
+network the search's visit distribution; value MSE teaches the eventual result
+from that position's player perspective. L2 discourages large parameters.
+Reports separate all three terms and policy KL (cross-entropy minus target
+entropy). Initial/final metrics use the full current replay; per-update metrics
+describe the sampled batch **before** its update. Lower training loss shows
+fitting these examples; it does not establish better Go play.
+
+Each candidate plays the accepted model with colors exchanged, using 64
+simulations per decision for both and a 400-move limit. Evaluation uses no
+self-play uniform mixture or temperature sampling. `--eval-simulations`,
+`--eval-max-moves` and `--eval-pairs` control the arena. Promotion requires every
+evaluation game to finish and candidate score (win=1, draw=0.5, loss=0) to meet
+`--promotion-score`, default 0.55. Rejected candidates are still saved.
+This is an empirical gate, not a guarantee of improvement: deterministic PUCT
+from an empty board produces the same two color games when seed pairs repeat.
+The loop therefore reports null paired confidence intervals and discloses
+those duplicates. More repeated pairs do not add independent evidence.
+
+The run directory contains:
+
+| Artifact | Meaning |
+| --- | --- |
+| `run.json` | Settings, next iteration, committed replay/model paths and history |
+| `initial.json` | Frozen starting weights and optimizer state |
+| `best.json` | Copy of the currently accepted checkpoint for the GUI |
+| `iteration-000001-attempt-1/games.json` | Self-play moves, raw states, root visits, outcomes and seeds |
+| `iteration-000001-attempt-1/examples.json` | Labels from this batch's completed games; absent if none completed |
+| `iteration-000001-attempt-1/replay.json` | Recent completed-game buffer after this iteration |
+| `iteration-000001-attempt-1/candidate.json` | Trained candidate, even when rejected; absent after an empty-replay skip |
+| `iteration-000001-attempt-1/arena.json` | Paired candidate/incumbent games and measured outcomes |
+| `iteration-000001-attempt-1/report.json` | Training losses, evaluation decision and elapsed time |
+
+The manifest is replaced only after an iteration finishes. Resume recovers the
+last committed model and buffer; an interrupted attempt is retained, and a new
+attempt directory uses the same iteration seeds. Use one process per run
+directory. Full replay metrics and explicit CPU search are intentionally
+simple; profile them before adding batching or other optimizations.
+
+For a small, fast exercise of the whole loop:
+
+```powershell
+.\build\selfplay.exe --output results/selfplay_tiny --size 3 --komi 0.5 --games 2 --simulations 16 --eval-simulations 16 --updates 20 --batch-size 8 --max-moves 100 --eval-max-moves 100 --seed 10
+```
+
+A 3x3 checkpoint cannot be used in the 9x9 GUI. Neither one iteration nor a
+particular milestone guarantees strong moves. Strength depends on useful
+completed games, search and model capacity, training stability and evaluation
+against varied opponents and positions. This loop now supplies the learning
+mechanism and records the evidence to judge its progress.
+
+## Measured performance (milestone 8)
+
+The native profiler measures a fixed collection of seeded positions, 64-simulation
+searches, a capped self-play game, and ten CPU training updates of 32 examples.
+The training targets in this benchmark are synthetic uniform policies; the
+benchmark measures execution speed, not playing strength. It reads checkpoints
+without updating your training run or its accepted model.
+
+```powershell
+.\build\profile.exe --checkpoint results/selfplay/best.json --output results/profile_before.json
+# After rebuilding a performance change, use the same immutable checkpoint:
+.\build\profile.exe --checkpoint results/selfplay/best.json --compare results/profile_before.json --output results/profile_after.json
+```
+
+Use a versioned `iteration-.../candidate.json` when a training process could
+replace `best.json` during the comparison. Options include `--repeats 5`,
+`--simulations 64`, and `--selfplay-moves 32`. Omit `--checkpoint` for a fixed
+fresh 9x9 network. A prefix that reaches its move limit is reported as truncated;
+it supplies no final outcome labels or training examples.
+
+Reports record the positions, model and optimizer fingerprints, compiler flags,
+machine details, and all timing samples. Timing medians are collected with
+profiling disabled after a warm-up. A separate opt-in profiling pass counts
+copies, group work, move probes, encoding, inference, expansion, and training.
+Inclusive durations overlap; exclusive durations exclude nested scopes. Scope
+timing adds clock overhead, so use the unprofiled medians for speed comparisons.
+Group benchmark units represent sweeps over every occupied point in a position.
+
+`--compare` checks the workload, machine, compiler flags and exact fingerprints
+of predictions, loss/gradients, two momentum updates, search statistics and
+seeded self-play moves/visit targets. It records speed ratios and returns a
+nonzero status on a mismatch. Run comparisons on a quiet machine; elapsed time
+will still vary. Profiling is local to the calling thread and inactive during
+normal play and training.
+
+The measured improvement uses compact internal liberty walks with direct board
+neighbors and returns as soon as a liberty is found. Placement successors copy
+only the board and history they need. Capture ordering, suicide and simple-ko
+checks, pass behavior, sorted public group results, and checkpoint formats remain
+the same. Independent reference tests cover these rules and feature planes,
+including 19x19 positions and larger boards supported by the rules engine.
+
+On this machine, five unprofiled samples using the fixed milestone 7 iteration 1
+checkpoint produced these median times:
+
+| Workload | Before | After | Speed ratio |
+| --- | ---: | ---: | ---: |
+| Five 9x9 searches, 64 simulations each | 0.312 s | 0.115 s | 2.70x |
+| Seeded 32-move self-play prefix, 64 simulations per move | 1.753 s | 0.905 s | 1.94x |
+
+All five behavior fingerprints matched exactly. These are local measurements
+of a fixed workload, not a promise for every position or a measure of strength.
+The unchanged public group API and neural calculations provide useful control
+workloads. Results are saved in `results/m8_baseline.json` and
+`results/m8_after.json`. All 151 native tests and the GUI checks passed; the
+608x876 canvas dump matched the milestone 7 canvas byte for byte.
 
 ## How search chooses a move
 
@@ -491,6 +670,10 @@ parity, legal outputs, and model lifetime. Neural arena tests check checkpoint
 snapshots, replay, color exchange, deterministic games, and separate inference
 and rollout accounting. GUI checks also exercise partial neural-search
 cancellation and verify the original dimensions and canvas.
+Self-play tests verify raw visit distributions, separate action sampling,
+root-only exploration, exact outcome perspectives, replayed ko history,
+truncated-game exclusion, FIFO persistence, deterministic minibatches and
+checkpoint continuation, plus the full tiny-board path through arena evaluation.
 
 ## Rules contract
 
@@ -556,6 +739,19 @@ shape and values, rather than proving the position arose through legal play.
     Follow `prepare_agent` in [src/arena.cpp](src/arena.cpp) to see how evaluation
     freezes a checkpoint before creating the agents.
 
-The C++ port deliberately keeps flood fills, explicit state copies, and a single
-legality definition. Future optimization should follow measurements. Self-play
-reinforcement learning is not implemented yet.
+18. Read [src/selfplay.cpp](src/selfplay.cpp) to trace root visits into targets,
+    temperature sampling and final-result labels. Follow one pass and check the
+    value sign against the pre-action player's color.
+19. Read [src/replay.cpp](src/replay.cpp) for FIFO game retention and sampling,
+    then [src/selfplay_main.cpp](src/selfplay_main.cpp) for freezing the incumbent,
+    training a candidate, evaluating it and committing a resumable iteration.
+20. [tests/test_selfplay.cpp](tests/test_selfplay.cpp) exercises that complete
+    path with tiny networks and deterministic outcomes.
+21. [src/profile_main.cpp](src/profile_main.cpp) separates unprofiled timing
+    samples from nested profiling scopes in [include/betago/profile.hpp](include/betago/profile.hpp).
+    Compare internal `has_liberty` with the public group traversal, then inspect
+    the independent reference checks in [tests/test_performance.cpp](tests/test_performance.cpp).
+
+The C++ implementation keeps explicit state copies and a single legality
+definition. Internal group walks now avoid building sets when a liberty check
+is sufficient. Further optimization should follow measurements.

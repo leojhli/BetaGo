@@ -75,12 +75,12 @@ try {
     }
     $taskHeaderTime = (Get-ChildItem 'include', 'third_party' -Recurse -File | Where-Object { $_.Extension -in @('.h', '.hpp') } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
     $taskObjects = @{}
-    foreach ($taskName in @('state', 'random', 'mcts', 'runner', 'arena', 'features', 'dataset', 'network', 'neural_mcts', 'tk', 'window', 'runner_main', 'play_main', 'network_main', 'test_main', 'test_mcts', 'test_arena', 'test_neural', 'test_neural_mcts', 'test_neural_arena')) {
-        $taskSource = if ($taskName -in @('test_main', 'test_mcts', 'test_arena', 'test_neural', 'test_neural_mcts', 'test_neural_arena')) { "tests/$taskName.cpp" } else { "src/$taskName.cpp" }
+    foreach ($taskName in @('state', 'random', 'mcts', 'runner', 'arena', 'features', 'dataset', 'network', 'neural_mcts', 'selfplay', 'replay', 'tk', 'window', 'runner_main', 'play_main', 'network_main', 'selfplay_main', 'profile_main', 'test_main', 'test_mcts', 'test_arena', 'test_neural', 'test_neural_mcts', 'test_neural_arena', 'test_selfplay', 'test_performance')) {
+        $taskSource = if ($taskName.StartsWith('test_')) { "tests/$taskName.cpp" } else { "src/$taskName.cpp" }
         $taskObject = "build/$taskName.o"
         if (-not $taskFlagsChanged -and (Test-Path $taskObject)) {
             $taskObjectTime = (Get-Item $taskObject).LastWriteTimeUtc
-            $taskInfoCurrent = $taskName -notin @('runner_main', 'network_main') -or $taskObjectTime -gt (Get-Item $taskInfoHeader).LastWriteTimeUtc
+            $taskInfoCurrent = $taskName -notin @('runner_main', 'network_main', 'selfplay_main', 'profile_main') -or $taskObjectTime -gt (Get-Item $taskInfoHeader).LastWriteTimeUtc
             if ($taskObjectTime -gt (Get-Item $taskSource).LastWriteTimeUtc -and $taskObjectTime -gt $taskHeaderTime -and $taskInfoCurrent) {
                 $taskObjects[$taskName] = $taskObject
                 continue
@@ -95,12 +95,15 @@ try {
     $taskCore = @($taskObjects.state, $taskObjects.random, $taskObjects.mcts, $taskObjects.runner)
     $taskNeural = @($taskObjects.features, $taskObjects.dataset, $taskObjects.network)
     $taskNeuralSearch = $taskNeural + @($taskObjects.neural_mcts)
-    foreach ($taskTarget in @('runner', 'play', 'network', 'tests')) {
+    $taskSelfPlay = $taskNeuralSearch + @($taskObjects.selfplay, $taskObjects.replay)
+    foreach ($taskTarget in @('runner', 'play', 'network', 'selfplay', 'profile', 'tests')) {
         $taskTargetObjects = switch ($taskTarget) {
             'runner' { $taskCore + $taskNeuralSearch + @($taskObjects.arena, $taskObjects.runner_main) }
             'play' { $taskCore + $taskNeuralSearch + @($taskObjects.tk, $taskObjects.window, $taskObjects.play_main) }
             'network' { $taskCore + $taskNeural + @($taskObjects.network_main) }
-            'tests' { $taskCore + $taskNeuralSearch + @($taskObjects.arena, $taskObjects.test_main, $taskObjects.test_mcts, $taskObjects.test_arena, $taskObjects.test_neural, $taskObjects.test_neural_mcts, $taskObjects.test_neural_arena) }
+            'selfplay' { $taskCore + $taskSelfPlay + @($taskObjects.arena, $taskObjects.selfplay_main) }
+            'profile' { $taskCore + $taskSelfPlay + @($taskObjects.profile_main) }
+            'tests' { $taskCore + $taskSelfPlay + @($taskObjects.arena, $taskObjects.test_main, $taskObjects.test_mcts, $taskObjects.test_arena, $taskObjects.test_neural, $taskObjects.test_neural_mcts, $taskObjects.test_neural_arena, $taskObjects.test_selfplay, $taskObjects.test_performance) }
         }
         Write-Host "Linking build/$taskTarget.exe"
         & $taskCompiler c++ @taskTargetObjects -o "build/$taskTarget.exe"
@@ -149,7 +152,7 @@ try {
         Copy-Item -LiteralPath ".tools/zig-x86_64-windows-0.14.1/lib/$taskCppLibrary/LICENSE.TXT" -Destination "build/licenses/$taskCppLibrary-LICENSE.txt" -Force
     }
     Copy-Item -LiteralPath '.tools/zig-x86_64-windows-0.14.1/lib/libc/mingw/COPYING' -Destination 'build/licenses/mingw-COPYING.txt' -Force
-    Write-Host 'Built: build/play.exe, build/runner.exe, build/network.exe, build/tests.exe'
+    Write-Host 'Built: build/play.exe, build/runner.exe, build/network.exe, build/selfplay.exe, build/profile.exe, build/tests.exe'
     if ($Test) {
         & './build/tests.exe' --oracle tests/fixtures/migration.json
         if ($LASTEXITCODE -ne 0) { throw 'C++ tests failed.' }

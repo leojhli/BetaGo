@@ -1,4 +1,5 @@
 #include "betago/network.hpp"
+#include "betago/profile.hpp"
 #include "betago/random.hpp"
 #include <algorithm>
 #include <cmath>
@@ -142,6 +143,7 @@ void PolicyValueNetwork::set_parameters(std::vector<double> parameters) {
 }
 
 PolicyValueNetwork::ForwardCache PolicyValueNetwork::forward(const EncodedPosition& input) const {
+    ProfileScope profile(ProfileWork::Forward);
     input.validate();
     if (input.board_size != settings_.board_size) throw std::invalid_argument("input board size does not match network");
     const int size = settings_.board_size;
@@ -236,6 +238,7 @@ std::vector<Prediction> PolicyValueNetwork::predict_batch(const std::vector<Enco
 
 GradientResult PolicyValueNetwork::objective(const std::vector<TrainingExample>& batch,
                                            double l2, bool gradients) const {
+    ProfileScope profile(ProfileWork::Objective);
     if (batch.empty()) throw std::invalid_argument("training batch must not be empty");
     if (!std::isfinite(l2) || l2 < 0) throw std::invalid_argument("l2 must be finite and nonnegative");
     for (const auto& example : batch) {

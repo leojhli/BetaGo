@@ -103,7 +103,9 @@ std::vector<TrainingExample> dataset_from_json(const Json& data) {
     try {
         if (integer(field(data, "schema_version"), 1, 1, "Dataset schema version") != 1)
             throw std::invalid_argument("Unsupported dataset schema version");
-        text_equals(field(data, "kind"), "scripted_go_examples", "kind");
+        const auto& kind = field(data, "kind");
+        if (!kind.is_string() || (kind != "scripted_go_examples" && kind != "self_play_examples"))
+            throw std::invalid_argument("Unsupported dataset kind");
         text_equals(field(data, "feature_schema"), FEATURE_SCHEMA, "feature schema");
         text_equals(field(data, "value_perspective"), "player_to_move", "value perspective");
         if (!field(data, "description").is_string())
