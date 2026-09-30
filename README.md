@@ -1,8 +1,6 @@
 # BetaGo
 
-A C++20 Go engine with the same playable wooden 9x9 board, capture and legality
-checks, area scoring, seeded random agents, and classical Monte Carlo tree
-search (MCTS). The long-term goal is a small self-learning Go engine inspired by
+A C++20 Go engine. The long-term goal is a small self-learning Go engine inspired by
 [KataGo](https://github.com/lightvector/KataGo).
 Currently it provides the rules environment, random and MCTS play, game
 recording, search statistics, an arena for repeatable agent comparisons, a
