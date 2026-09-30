@@ -5,6 +5,7 @@
 #include "build_info.hpp"
 #include <cstdlib>
 #include <ctime>
+#include <cwctype>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -12,6 +13,93 @@
 #include <thread>
 
 namespace {
+bool uses_checkpoint(const std::string& kind) { return kind == "policy" || kind == "neural-mcts"; }
+
+bool same_file_path(const std::filesystem::path& first, const std::filesystem::path& second) {
+    std::error_code error;
+    if (std::filesystem::equivalent(first, second, error) && !error) return true;
+    auto normalized = [](const std::filesystem::path& path) {
+        std::error_code failure;
+        auto absolute = std::filesystem::weakly_canonical(std::filesystem::absolute(path), failure);
+        if (failure) absolute = std::filesystem::absolute(path).lexically_normal();
+        auto text = absolute.generic_wstring();
+#if defined(_WIN32)
+        for (auto& character : text) character = static_cast<wchar_t>(std::towlower(character));
+#endif
+        return text;
+    };
+    return normalized(first) == normalized(second);
+}
+
+void protect_checkpoints(const std::string& output,
+                         std::initializer_list<betago::AgentConfiguration> configurations) {
+    for (const auto& configuration : configurations)
+        if (!configuration.checkpoint.empty() && same_file_path(output, configuration.checkpoint))
+            throw std::invalid_argument("--output must not overwrite an input checkpoint");
+}
+
+betago::AgentConfiguration agent_configuration(const betago::Options& args, const std::string& kind,
+                                               const betago::MctsSettings& settings,
+                                               const std::string& checkpoint_option,
+                                               const std::string& puct_option = "",
+                                               const std::string& simulations_option = "",
+                                               const std::string& exploration_option = "",
+                                               const std::string& rollout_option = "") {
+    using namespace betago;
+    AgentConfiguration result;
+    result.kind = kind;
+    if (uses_checkpoint(kind)) {
+        for (const auto& option : {exploration_option, rollout_option})
+            if (!option.empty() && args.has(option))
+                throw std::invalid_argument(option + " requires a classical mcts agent");
+        if (kind == "policy" && !simulations_option.empty() && args.has(simulations_option))
+            throw std::invalid_argument(simulations_option + " requires an mcts or neural-mcts agent");
+    }
+    result.search = {simulations_option.empty() ? settings.simulations : args.integer(simulations_option, settings.simulations),
+        exploration_option.empty() ? settings.exploration : args.real(exploration_option, settings.exploration),
+        rollout_option.empty() ? settings.rollout_limit : args.integer(rollout_option, settings.rollout_limit)};
+    if (args.has(checkpoint_option) && !uses_checkpoint(kind))
+        throw std::invalid_argument(checkpoint_option + " requires a policy or neural-mcts agent");
+    if (args.has(checkpoint_option)) result.checkpoint = args.text(checkpoint_option);
+    else if (uses_checkpoint(kind)) result.checkpoint = args.text("--checkpoint");
+    if (!puct_option.empty() && args.has(puct_option) && kind != "neural-mcts")
+        throw std::invalid_argument(puct_option + " requires a neural-mcts agent");
+    result.neural = {result.search.simulations,
+        puct_option.empty() ? args.real("--c-puct", 1.5) : args.real(puct_option, args.real("--c-puct", 1.5))};
+    result.validate();
+    return result;
+}
+
+void validate_common_search_options(const betago::Options& args,
+                                   std::initializer_list<betago::AgentConfiguration> agents) {
+    bool has_classical = false, has_neural = false, has_search = false;
+    for (const auto& agent : agents) {
+        has_classical = has_classical || agent.kind == "mcts";
+        has_neural = has_neural || uses_checkpoint(agent.kind);
+        has_search = has_search || agent.kind == "mcts" || agent.kind == "neural-mcts";
+    }
+    if (has_neural && !has_classical)
+        for (const auto* option : {"--exploration", "--rollout-limit"})
+            if (args.has(option)) throw std::invalid_argument(std::string(option) + " requires a classical mcts agent");
+    if (has_neural && !has_search && args.has("--simulations"))
+        throw std::invalid_argument("--simulations requires an mcts or neural-mcts agent");
+}
+
+void validate_common_neural_options(const betago::Options& args,
+                                   std::initializer_list<std::pair<betago::AgentConfiguration, std::string>> agents) {
+    bool checkpoint_used = false, puct_used = false;
+    for (const auto& [configuration, checkpoint_option] : agents) {
+        checkpoint_used = checkpoint_used || (uses_checkpoint(configuration.kind) && !args.has(checkpoint_option));
+        const std::string override = checkpoint_option == "--a-checkpoint" ? "--a-c-puct" :
+                                     checkpoint_option == "--b-checkpoint" ? "--b-c-puct" : "";
+        puct_used = puct_used || (configuration.kind == "neural-mcts" && (override.empty() || !args.has(override)));
+    }
+    if (args.has("--checkpoint") && !checkpoint_used)
+        throw std::invalid_argument("--checkpoint is unused; select a neural agent without a checkpoint override");
+    if (args.has("--c-puct") && !puct_used)
+        throw std::invalid_argument("--c-puct is unused; select a neural-mcts agent without a PUCT override");
+}
+
 betago::Json environment_value(const char* name) {
     auto value = std::getenv(name);
     return value && *value ? betago::Json(value) : betago::Json(nullptr);
@@ -85,6 +173,9 @@ void print_arena_summary(const betago::Json& summary) {
                   << agent.at("simulations") << " simulations; "
                   << number_or_na(agent.at("simulations_per_second"), 1) << " simulations/s; "
                   << agent.at("truncated_rollouts") << " rollout cutoffs\n";
+        if (agent.contains("network_evaluations"))
+            std::cout << "  Neural work: " << agent.at("network_evaluations") << " network evaluations; "
+                      << agent.at("terminal_evaluations") << " exact terminal evaluations\n";
         for (const auto* measure : {"win", "score"}) {
             const auto& interval = agent.at(std::string("paired_") + measure + "_rate_95");
             std::cout << "  Paired " << measure << " rate: ";
@@ -101,39 +192,54 @@ void print_arena_summary(const betago::Json& summary) {
 int main(int argc, char** argv) {
     using namespace betago;
     try {
-        Options args(argc, argv, {"--size", "--komi", "--games", "--seed", "--max-moves", "--output", "--replay",
+        const std::set<std::string> valued{"--size", "--komi", "--games", "--seed", "--max-moves", "--output", "--replay",
             "--black", "--white", "--simulations", "--rollout-limit", "--exploration",
             "--agent-a", "--agent-b", "--pairs", "--a-simulations", "--b-simulations",
-            "--a-rollout-limit", "--b-rollout-limit", "--a-exploration", "--b-exploration"},
-            {"--help", "--benchmark", "--arena"});
+            "--a-rollout-limit", "--b-rollout-limit", "--a-exploration", "--b-exploration",
+            "--agent", "--checkpoint", "--black-checkpoint", "--white-checkpoint",
+            "--a-checkpoint", "--b-checkpoint", "--c-puct", "--a-c-puct", "--b-c-puct"};
+        Options args(argc, argv, valued, {"--help", "--benchmark", "--arena"});
         if (args.has("--help")) {
-            std::cout << "BetaGo game runner (random or classical MCTS)\n"
+            std::cout << "BetaGo game runner (random, classical MCTS, policy, or neural MCTS)\n"
                       << "runner.exe [--size 9] [--komi 7.5] [--games 1] [--seed 0]\n"
                       << "           [--max-moves 500] [--output results/random_games.json]\n"
-                      << "           [--black random|mcts] [--white random|mcts]\n"
+                      << "           [--black random|mcts|policy|neural-mcts] [--white random|mcts|policy|neural-mcts]\n"
+                      << "           [--checkpoint results/policy_value.json] [--black-checkpoint path] [--white-checkpoint path]\n"
                       << "           [--simulations 128] [--rollout-limit 200] [--exploration 1.4142135623730951]\n"
                       << "runner.exe --replay results/random_games.json\n"
-                      << "runner.exe --benchmark [--size 9] [--simulations 128] [--seed 0]\n"
+                      << "runner.exe --benchmark [--agent mcts|policy|neural-mcts] [--size 9] [--simulations 128] [--seed 0]\n"
                       << "runner.exe --arena [--agent-a mcts] [--agent-b random] [--pairs 5]\n"
                       << "           [--size 3] [--komi 7.5] [--max-moves 100] [--seed 0]\n"
                       << "           [--a-simulations 128] [--b-simulations 128] [--output results/arena.json]\n"
                       << "           [--a-rollout-limit 200] [--b-rollout-limit 200]\n"
                       << "           [--a-exploration 1.4142135623730951] [--b-exploration 1.4142135623730951]\n"
+                      << "           [--a-checkpoint path] [--b-checkpoint path] [--c-puct 1.5] [--a-c-puct 1.5] [--b-c-puct 1.5]\n"
                       << "Each pair plays both color assignments with fixed identity seeds.\n"
-                      << "Common search settings are fallbacks for each agent's settings.\n";
+                      << "Common search/checkpoint settings are fallbacks for each agent. Neural agents require a matching checkpoint.\n"
+                      << "Policy selects the highest legal prior; neural-mcts uses PUCT and network leaf values without rollouts.\n";
             return 0;
         }
         if (int(args.has("--arena")) + int(args.has("--benchmark")) + int(args.has("--replay")) > 1)
             throw std::invalid_argument("Choose one of --arena, --benchmark, or --replay");
         if (!args.has("--arena")) {
             for (const auto* key : {"--agent-a", "--agent-b", "--pairs", "--a-simulations", "--b-simulations",
-                                   "--a-rollout-limit", "--b-rollout-limit", "--a-exploration", "--b-exploration"})
+                                   "--a-rollout-limit", "--b-rollout-limit", "--a-exploration", "--b-exploration",
+                                   "--a-checkpoint", "--b-checkpoint", "--a-c-puct", "--b-c-puct"})
                 if (args.has(key)) throw std::invalid_argument(std::string(key) + " requires --arena");
         } else {
-            for (const auto* key : {"--games", "--black", "--white"})
+            for (const auto* key : {"--games", "--black", "--white", "--black-checkpoint", "--white-checkpoint"})
                 if (args.has(key)) throw std::invalid_argument(std::string(key) + " cannot be used with --arena; use --pairs and --agent-a/--agent-b");
         }
+        if (!args.has("--benchmark") && args.has("--agent"))
+            throw std::invalid_argument("--agent requires --benchmark; use --black/--white or --agent-a/--agent-b");
+        if (args.has("--benchmark")) {
+            for (const auto* key : {"--games", "--black", "--white", "--max-moves", "--black-checkpoint", "--white-checkpoint"})
+                if (args.has(key)) throw std::invalid_argument(std::string(key) + " cannot be used with --benchmark");
+        }
         if (args.has("--replay")) {
+            for (const auto& key : valued)
+                if (key != "--replay" && args.has(key))
+                    throw std::invalid_argument(key + " cannot be used with --replay");
             auto data = load_records(args.text("--replay"));
             int index = 0;
             for (const auto& record : data.at("games")) {
@@ -149,15 +255,17 @@ int main(int argc, char** argv) {
         auto seed = args.integer<std::int64_t>("--seed", 0);
         if (args.has("--arena")) {
             ArenaSettings arena;
-            arena.a = {args.text("--agent-a", "mcts"),
-                {args.integer("--a-simulations", settings.simulations), args.real("--a-exploration", settings.exploration),
-                 args.integer("--a-rollout-limit", settings.rollout_limit)}};
-            arena.b = {args.text("--agent-b", "random"),
-                {args.integer("--b-simulations", settings.simulations), args.real("--b-exploration", settings.exploration),
-                 args.integer("--b-rollout-limit", settings.rollout_limit)}};
+            arena.a = agent_configuration(args, args.text("--agent-a", "mcts"), settings, "--a-checkpoint",
+                "--a-c-puct", "--a-simulations", "--a-exploration", "--a-rollout-limit");
+            arena.b = agent_configuration(args, args.text("--agent-b", "random"), settings, "--b-checkpoint",
+                "--b-c-puct", "--b-simulations", "--b-exploration", "--b-rollout-limit");
+            validate_common_neural_options(args, {{arena.a, "--a-checkpoint"}, {arena.b, "--b-checkpoint"}});
+            validate_common_search_options(args, {arena.a, arena.b});
             arena.pairs = args.integer("--pairs", 5); arena.size = args.integer("--size", 3);
             arena.max_moves = args.integer("--max-moves", 100); arena.komi = args.real("--komi", 7.5); arena.seed = seed;
             arena.validate();
+            auto output = args.text("--output", "results/arena.json");
+            protect_checkpoints(output, {arena.a, arena.b});
             std::cout << "A: " << arena.a.kind << "; B: " << arena.b.kind << "; " << arena.pairs
                       << " color pairs on " << arena.size << 'x' << arena.size << '\n' << std::flush;
             auto data = run_arena(arena, arena_metadata(), [](int index, const Json& record) {
@@ -165,77 +273,121 @@ int main(int argc, char** argv) {
                           << ", Black " << (record.at("black_agent") == "a" ? "A" : "B") << "): "
                           << describe(record) << '\n' << std::flush;
             });
-            auto output = args.text("--output", "results/arena.json");
             save_records(output, data);
             print_arena_summary(data.at("summary"));
             std::cout << "Saved " << output << '\n';
             return 0;
         }
         if (args.has("--benchmark")) {
-            MctsAgent agent(settings, seed);
-            auto state = GameState::new_game(args.integer("--size", 9), args.real("--komi", 7.5));
-            auto move = agent.choose_move(state);
-            const auto& stats = agent.last_search();
-            Json record = search_statistics_json(stats);
-            record["size"] = state.size(); record["komi"] = state.komi(); record["seed"] = seed;
-            record["settings"] = mcts_settings_json(settings);
-            record["selected_move"] = move ? Json::array({move->row, move->column}) : Json(nullptr);
-            std::cout << stats.simulations << " simulations in " << std::fixed << std::setprecision(3)
-                      << stats.elapsed_seconds << "s | " << std::setprecision(1) << stats.simulations_per_second()
-                      << " simulations/s | " << stats.truncated_rollouts << " truncated rollouts\n";
-            std::cout << "Selected " << (move ? "(" + std::to_string(move->row) + ", " + std::to_string(move->column) + ")" : "pass") << '\n';
+            const auto kind = args.text("--agent", "mcts");
+            if (kind == "random") throw std::invalid_argument("Benchmark agent must be mcts, policy, or neural-mcts");
+            const auto configuration = agent_configuration(args, kind, settings, "--checkpoint");
+            validate_common_search_options(args, {configuration});
+            if (args.has("--c-puct") && kind != "neural-mcts")
+                throw std::invalid_argument("--c-puct requires a neural-mcts agent");
             auto path = args.text("--output", "results/search_benchmark.json");
+            protect_checkpoints(path, {configuration});
+            auto state = GameState::new_game(args.integer("--size", 9), args.real("--komi", 7.5));
+            auto prepared = prepare_agent(configuration, state.size());
+            auto agent = prepared.create(seed);
+            auto started = std::chrono::steady_clock::now();
+            const auto decision = agent(state);
+            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            const auto move = decision.move;
+            Json record = decision.search ? search_statistics_json(*decision.search) : Json::object();
+            record["size"] = state.size(); record["komi"] = state.komi(); record["seed"] = seed;
+            record["settings"] = kind == "neural-mcts" ? neural_mcts_settings_json(configuration.neural) :
+                                  kind == "mcts" ? mcts_settings_json(settings) : Json::object();
+            if (uses_checkpoint(kind)) {
+                record["agent"] = prepared.to_json();
+                record["decision_seconds"] = elapsed;
+            }
+            if (decision.prediction) {
+                record["policy"] = prediction_json(*decision.prediction);
+                record["network_evaluations"] = 1;
+            }
+            record["selected_move"] = move ? Json::array({move->row, move->column}) : Json(nullptr);
+            if (decision.search) {
+                const auto& stats = *decision.search;
+                std::cout << stats.simulations << " simulations in " << std::fixed << std::setprecision(3)
+                          << stats.elapsed_seconds << "s | " << std::setprecision(1) << stats.simulations_per_second()
+                          << " simulations/s";
+                if (kind == "neural-mcts")
+                    std::cout << " | " << stats.network_evaluations << " network / " << stats.terminal_evaluations << " terminal evaluations\n";
+                else std::cout << " | " << stats.truncated_rollouts << " truncated rollouts\n";
+            } else std::cout << "Policy inference in " << elapsed << "s\n";
+            std::cout << "Selected " << (move ? "(" + std::to_string(move->row) + ", " + std::to_string(move->column) + ")" : "pass") << '\n';
             save_records(path, record);
             std::cout << "Saved " << path << '\n';
             return 0;
         }
         auto black_name = args.text("--black", "random"), white_name = args.text("--white", "random");
-        for (const auto& name : {black_name, white_name})
-            if (name != "random" && name != "mcts") throw std::invalid_argument("Agent must be random or mcts");
+        const auto black_configuration = agent_configuration(args, black_name, settings, "--black-checkpoint");
+        const auto white_configuration = agent_configuration(args, white_name, settings, "--white-checkpoint");
+        validate_common_neural_options(args, {{black_configuration, "--black-checkpoint"}, {white_configuration, "--white-checkpoint"}});
+        validate_common_search_options(args, {black_configuration, white_configuration});
         int games = args.integer("--games", 1);
         if (games < 1) throw std::invalid_argument("Number of games must be positive");
         if (seed > std::numeric_limits<std::int64_t>::max() - (2LL * games - 1))
             throw std::invalid_argument("Batch seeds exceed signed 64-bit range");
+        const auto output = args.text("--output", "results/random_games.json");
+        protect_checkpoints(output, {black_configuration, white_configuration});
+        const int size = args.integer("--size", 9), max_moves = args.integer("--max-moves", 500);
+        const double komi = args.real("--komi", 7.5);
+        if (max_moves < 1) throw std::invalid_argument("Move limit must be positive");
+        const auto prepared_black = prepare_agent(black_configuration, size);
+        const auto prepared_white = prepare_agent(white_configuration, size);
         Json records = Json::array();
         int completed = 0;
         for (int index = 0; index < games; ++index) {
             auto black_seed = seed + 2LL * index, white_seed = black_seed + 1;
-            RandomAgent black(black_seed), white(white_seed);
-            MctsAgent black_mcts(settings, black_seed), white_mcts(settings, white_seed);
+            auto black = prepared_black.create(black_seed), white = prepared_white.create(white_seed);
             Json searches = Json::array();
+            Json policies = Json::array();
             int action_index = 0;
-            auto choose = [&](const GameState& state, const std::string& name, RandomAgent& random, MctsAgent& mcts) {
+            auto choose = [&](const GameState& state, ArenaAgent& agent) {
                 ++action_index;
-                if (name == "random") return random.choose_move(state);
-                Move move = mcts.choose_move(state);
-                Json search = search_statistics_json(mcts.last_search());
-                search["move_number"] = action_index; search["player"] = state.to_play();
-                searches.push_back(search);
-                return move;
+                const auto decision = agent(state);
+                if (decision.search) {
+                    Json search = search_statistics_json(*decision.search);
+                    search["move_number"] = action_index; search["player"] = state.to_play();
+                    searches.push_back(std::move(search));
+                }
+                if (decision.prediction) {
+                    Json policy = prediction_json(*decision.prediction);
+                    policy["move_number"] = action_index; policy["player"] = state.to_play();
+                    policy["network_evaluations"] = 1;
+                    policies.push_back(std::move(policy));
+                }
+                return decision.move;
             };
-            auto result = run_game([&](const GameState& s) { return choose(s, black_name, black, black_mcts); },
-                                   [&](const GameState& s) { return choose(s, white_name, white, white_mcts); },
-                                   args.integer("--size", 9), args.real("--komi", 7.5), args.integer("--max-moves", 500));
+            auto result = run_game([&](const GameState& s) { return choose(s, black); },
+                                   [&](const GameState& s) { return choose(s, white); }, size, komi, max_moves);
             Json record = result.to_json();
             record["black_seed"] = black_seed;
             record["white_seed"] = white_seed;
             if (!searches.empty()) record["searches"] = searches;
+            if (!policies.empty()) record["policies"] = policies;
             records.push_back(record);
             completed += result.final_state.is_terminal();
             std::cout << "Game " << index + 1 << ": " << describe(record) << '\n';
             if (!searches.empty()) {
-                std::int64_t rollouts = 0, truncated = 0;
+                std::int64_t simulations = 0, truncated = 0, network = 0, terminal = 0;
                 for (const auto& search : searches) {
-                    rollouts += search["simulations"].get<int>(); truncated += search["truncated_rollouts"].get<int>();
+                    simulations += search["simulations"].get<int>(); truncated += search["truncated_rollouts"].get<int>();
+                    network += search.value("network_evaluations", 0); terminal += search.value("terminal_evaluations", 0);
                 }
-                std::cout << "  Search: " << rollouts << " simulations; " << truncated << " truncated rollouts\n";
+                std::cout << "  Search: " << simulations << " simulations; " << truncated << " truncated rollouts";
+                if (network || terminal) std::cout << "; " << network << " network / " << terminal << " terminal evaluations";
+                std::cout << '\n';
             }
         }
         Json data = {{"schema_version", 1}, {"seed", seed},
             {"agents", {{"black", black_name}, {"white", white_name}}},
             {"rules", "simple ko, no suicide, area scoring, no dead-group adjudication"}, {"games", records}};
         if (black_name == "mcts" || white_name == "mcts") data["mcts_settings"] = mcts_settings_json(settings);
-        auto output = args.text("--output", "results/random_games.json");
+        if (uses_checkpoint(black_name) || uses_checkpoint(white_name))
+            data["agent_configurations"] = {{"black", prepared_black.to_json()}, {"white", prepared_white.to_json()}};
         save_records(output, data);
         std::cout << "Completed: " << completed << "; truncated: " << games - completed << "\nSaved " << output << '\n';
         return 0;

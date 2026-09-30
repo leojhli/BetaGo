@@ -75,8 +75,8 @@ try {
     }
     $taskHeaderTime = (Get-ChildItem 'include', 'third_party' -Recurse -File | Where-Object { $_.Extension -in @('.h', '.hpp') } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
     $taskObjects = @{}
-    foreach ($taskName in @('state', 'random', 'mcts', 'runner', 'arena', 'features', 'dataset', 'network', 'tk', 'window', 'runner_main', 'play_main', 'network_main', 'test_main', 'test_mcts', 'test_arena', 'test_neural')) {
-        $taskSource = if ($taskName -in @('test_main', 'test_mcts', 'test_arena', 'test_neural')) { "tests/$taskName.cpp" } else { "src/$taskName.cpp" }
+    foreach ($taskName in @('state', 'random', 'mcts', 'runner', 'arena', 'features', 'dataset', 'network', 'neural_mcts', 'tk', 'window', 'runner_main', 'play_main', 'network_main', 'test_main', 'test_mcts', 'test_arena', 'test_neural', 'test_neural_mcts', 'test_neural_arena')) {
+        $taskSource = if ($taskName -in @('test_main', 'test_mcts', 'test_arena', 'test_neural', 'test_neural_mcts', 'test_neural_arena')) { "tests/$taskName.cpp" } else { "src/$taskName.cpp" }
         $taskObject = "build/$taskName.o"
         if (-not $taskFlagsChanged -and (Test-Path $taskObject)) {
             $taskObjectTime = (Get-Item $taskObject).LastWriteTimeUtc
@@ -94,12 +94,13 @@ try {
     Set-Content -LiteralPath $taskStamp -Value $taskFlagSignature
     $taskCore = @($taskObjects.state, $taskObjects.random, $taskObjects.mcts, $taskObjects.runner)
     $taskNeural = @($taskObjects.features, $taskObjects.dataset, $taskObjects.network)
+    $taskNeuralSearch = $taskNeural + @($taskObjects.neural_mcts)
     foreach ($taskTarget in @('runner', 'play', 'network', 'tests')) {
         $taskTargetObjects = switch ($taskTarget) {
-            'runner' { $taskCore + @($taskObjects.arena, $taskObjects.runner_main) }
-            'play' { $taskCore + @($taskObjects.tk, $taskObjects.window, $taskObjects.play_main) }
+            'runner' { $taskCore + $taskNeuralSearch + @($taskObjects.arena, $taskObjects.runner_main) }
+            'play' { $taskCore + $taskNeuralSearch + @($taskObjects.tk, $taskObjects.window, $taskObjects.play_main) }
             'network' { $taskCore + $taskNeural + @($taskObjects.network_main) }
-            'tests' { $taskCore + $taskNeural + @($taskObjects.arena, $taskObjects.test_main, $taskObjects.test_mcts, $taskObjects.test_arena, $taskObjects.test_neural) }
+            'tests' { $taskCore + $taskNeuralSearch + @($taskObjects.arena, $taskObjects.test_main, $taskObjects.test_mcts, $taskObjects.test_arena, $taskObjects.test_neural, $taskObjects.test_neural_mcts, $taskObjects.test_neural_arena) }
         }
         Write-Host "Linking build/$taskTarget.exe"
         & $taskCompiler c++ @taskTargetObjects -o "build/$taskTarget.exe"

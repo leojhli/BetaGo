@@ -16,6 +16,7 @@ struct MoveStatistics {
     int visits;
     // Value is measured for the child state's player to move.
     double value_sum;
+    double prior = 0;
 };
 
 struct SearchStatistics {
@@ -26,6 +27,9 @@ struct SearchStatistics {
     double root_value_sum = 0;
     double elapsed_seconds = 0;
     std::vector<MoveStatistics> children;
+    std::string algorithm = "uct";
+    int network_evaluations = 0;
+    int terminal_evaluations = 0;
     double simulations_per_second() const;
 };
 

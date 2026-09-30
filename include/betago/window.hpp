@@ -1,6 +1,7 @@
 #pragma once
 #include "random.hpp"
 #include "mcts.hpp"
+#include "neural_mcts.hpp"
 #include "tk.hpp"
 #include <iosfwd>
 #include <utility>
@@ -8,7 +9,8 @@
 namespace betago {
 class GoWindow {
 public:
-    GoWindow(std::int64_t seed = 0, int max_moves = 500, int delay_ms = 500, MctsSettings settings = {});
+    GoWindow(std::int64_t seed = 0, int max_moves = 500, int delay_ms = 500, MctsSettings settings = {},
+             std::shared_ptr<const PolicyValueNetwork> network = {}, NeuralMctsSettings neural_settings = {});
     void start_random();
     void start_mcts(bool watch = false);
     void run() { tk_.loop(); }
@@ -30,6 +32,10 @@ private:
     MctsSettings mcts_settings_;
     std::unique_ptr<MctsAgent> mcts_agent_;
     std::unique_ptr<MctsSearch> search_;
+    std::shared_ptr<const PolicyValueNetwork> network_;
+    NeuralMctsSettings neural_settings_;
+    std::unique_ptr<NeuralMctsAgent> neural_agent_;
+    std::unique_ptr<NeuralMctsSearch> neural_search_;
     bool mcts_mode_ = false, mcts_watch_ = false;
     static int callback(void* data, Tcl_Interp*, int count, Tcl_Obj* const objects[]);
     void action(const std::vector<std::string>& args);
@@ -48,6 +54,8 @@ private:
     void random_step();
     bool computer_turn() const;
     void stop_mcts();
+    void configure_search_buttons();
+    std::string search_name() const;
     void toggle_mcts(bool watch);
     void schedule_mcts();
     void mcts_step();

@@ -12,11 +12,16 @@
 
 namespace betago {
 const std::vector<Point> GoWindow::DEMO = {{0, 1}, {1, 1}, {1, 0}, {8, 8}, {2, 1}, {8, 7}, {1, 2}};
-GoWindow::GoWindow(std::int64_t seed, int max_moves, int delay_ms, MctsSettings settings)
-    : seed_(seed), max_moves_(max_moves), delay_ms_(delay_ms), black_(seed), white_(0), mcts_settings_(settings) {
+GoWindow::GoWindow(std::int64_t seed, int max_moves, int delay_ms, MctsSettings settings,
+                   std::shared_ptr<const PolicyValueNetwork> network, NeuralMctsSettings neural_settings)
+    : seed_(seed), max_moves_(max_moves), delay_ms_(delay_ms), black_(seed), white_(0), mcts_settings_(settings),
+      network_(std::move(network)), neural_settings_(neural_settings) {
     if (max_moves < 1 || delay_ms < 1) throw std::invalid_argument("Move limit and delay must be positive");
     if (seed == std::numeric_limits<std::int64_t>::max()) throw std::invalid_argument("White's seed exceeds signed 64-bit range");
     mcts_settings_.validate();
+    if (network_) neural_settings_.validate();
+    if (network_ && (network_->settings().board_size != 9 || network_->training()))
+        throw std::invalid_argument("The visual board needs a 9x9 network in evaluation mode");
     tk_.command("betago", callback, this);
     tk_.eval(R"TK(
 wm title . {BetaGo - 9x9 Go}
@@ -65,6 +70,7 @@ pack .p.watch.mcts -side left
 ttk::label .p.footer -text {Finish captures before passing. Remaining stones count toward area.} -wraplength 540
 pack .p.footer -anchor w -pady {12 0}
 )TK");
+    configure_search_buttons();
     draw_board();
     draw();
 }
@@ -220,14 +226,15 @@ void GoWindow::play(Move move) {
     else if (!move) notice("Passed. Another pass will end the game.");
     else if (captured) notice("Captured " + std::to_string(captured) + " stone(s). The empty intersections can be played again.");
     else if (!random_job_.empty()) notice("Random agents are choosing legal moves, including pass.");
-    else if (mcts_mode_) notice(mcts_watch_ ? "Watching MCTS (Black) vs random (White)." : "Your turn as Black. White uses MCTS.");
+    else if (mcts_mode_) notice(mcts_watch_ ? "Watching " + search_name() + " (Black) vs random (White)."
+                                          : "Your turn as Black. White uses " + search_name() + ".");
     else notice("Click an intersection to place a stone.");
     if (mcts_mode_) {
         if (state_.is_terminal()) {
-            stop_mcts(); mode("9 x 9   /   MCTS game finished   /   Komi 7.5");
+            stop_mcts(); mode("9 x 9   /   " + search_name() + " game finished   /   Komi 7.5");
         } else if (mcts_watch_ && history_.size() >= static_cast<std::size_t>(max_moves_)) {
             stop_mcts(); random_truncated_ = true;
-            mode("9 x 9   /   MCTS game truncated   /   Komi 7.5");
+            mode("9 x 9   /   " + search_name() + " game truncated   /   Komi 7.5");
             notice("Move limit reached. No final score. Continue playing or start a new game.");
         } else schedule_mcts();
     }
@@ -291,24 +298,31 @@ void GoWindow::random_step() {
 bool GoWindow::computer_turn() const {
     return mcts_mode_ && !state_.is_terminal() && (mcts_watch_ || state_.to_play() == WHITE);
 }
+std::string GoWindow::search_name() const { return network_ ? "Neural MCTS" : "MCTS"; }
+void GoWindow::configure_search_buttons() {
+    tk_.eval(network_ ? ".p.watch.human configure -text {Play vs neural MCTS}; .p.watch.mcts configure -text {Watch neural MCTS vs random}"
+                      : ".p.watch.human configure -text {Play vs MCTS}; .p.watch.mcts configure -text {Watch MCTS vs random}");
+}
 void GoWindow::stop_mcts() {
     if (!mcts_job_.empty()) { tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_job_.clear(); }
     // Searches borrow the agent's random generator, so destroy the search first.
-    search_.reset(); mcts_agent_.reset(); mcts_mode_ = mcts_watch_ = false;
-    tk_.eval(".p.watch.human configure -text {Play vs MCTS}; .p.watch.mcts configure -text {Watch MCTS vs random}");
+    search_.reset(); neural_search_.reset(); mcts_agent_.reset(); neural_agent_.reset(); mcts_mode_ = mcts_watch_ = false;
+    configure_search_buttons();
     mode("9 x 9   /   Local play   /   Komi 7.5");
 }
 void GoWindow::start_mcts(bool watch) { toggle_mcts(watch); }
 void GoWindow::toggle_mcts(bool watch) {
     if (mcts_mode_ && mcts_watch_ == watch) {
-        stop_mcts(); notice("MCTS stopped. You can continue playing this position."); draw(); return;
+        stop_mcts(); notice(search_name() + " stopped. You can continue playing this position."); draw(); return;
     }
     new_game(); mcts_mode_ = true; mcts_watch_ = watch;
-    mcts_agent_ = std::make_unique<MctsAgent>(mcts_settings_, watch ? seed_ : seed_ + 1);
+    if (network_) neural_agent_ = std::make_unique<NeuralMctsAgent>(network_, neural_settings_);
+    else mcts_agent_ = std::make_unique<MctsAgent>(mcts_settings_, watch ? seed_ : seed_ + 1);
     white_ = RandomAgent(seed_ + 1);
-    mode(std::string("9 x 9   /   ") + (watch ? "MCTS vs random" : "You (Black) vs MCTS") + "   /   Komi 7.5");
-    tk_.eval(watch ? ".p.watch.mcts configure -text {Stop MCTS game}" : ".p.watch.human configure -text {Stop MCTS}");
-    notice(watch ? "Watching MCTS (Black) vs random (White)." : "Your turn as Black. White uses MCTS.");
+    mode(std::string("9 x 9   /   ") + (watch ? search_name() + " vs random" : "You (Black) vs " + search_name()) + "   /   Komi 7.5");
+    tk_.eval(std::string(watch ? ".p.watch.mcts" : ".p.watch.human") + " configure -text " +
+             tcl_quote("Stop " + search_name() + (watch ? " game" : "")));
+    notice(watch ? "Watching " + search_name() + " (Black) vs random (White)." : "Your turn as Black. White uses " + search_name() + ".");
     schedule_mcts(); draw();
 }
 void GoWindow::schedule_mcts() {
@@ -319,6 +333,25 @@ void GoWindow::mcts_step() {
     mcts_job_.clear();
     if (!computer_turn()) return;
     if (mcts_watch_ && state_.to_play() == WHITE) { play(white_.choose_move(state_)); return; }
+    if (network_) {
+        if (!neural_search_) neural_search_ = neural_agent_->start_search(state_);
+        // One bounded PUCT simulation per callback keeps every control usable.
+        neural_search_->step();
+        auto stats = neural_search_->statistics();
+        if (!neural_search_->finished()) {
+            notice("Neural MCTS thinking: " + std::to_string(stats.simulations) + "/" +
+                std::to_string(neural_settings_.simulations) + " PUCT simulations, " +
+                std::to_string(stats.network_evaluations) + " network evaluations.");
+            mcts_job_ = tk_.eval("after 1 {betago mcts_step}"); return;
+        }
+        auto move = neural_search_->best_move(); neural_search_.reset();
+        play(move);
+        if (mcts_mode_) notice("Last search: " + std::to_string(stats.simulations) + " PUCT simulations, " +
+            std::to_string(stats.network_evaluations) + " network evaluations, " +
+            std::to_string(stats.terminal_evaluations) + " terminal evaluations. " +
+            (mcts_watch_ ? "Watching neural MCTS vs random." : "Your turn as Black."));
+        return;
+    }
     if (!search_) search_ = mcts_agent_->start_search(state_);
     // Yield to Tk after each bounded rollout, so reset, undo and stop work
     // throughout a search. The board is changed only when the budget is complete.
@@ -336,6 +369,8 @@ void GoWindow::mcts_step() {
 void GoWindow::close() { stop_demo(); stop_random(); stop_mcts(); tk_.eval("destroy ."); }
 
 void GoWindow::self_test() {
+    // Exercise the original modes first, regardless of startup options.
+    network_.reset(); configure_search_buttons();
     // Tk ignores mouse events for an unmapped canvas. Map it off-screen so the
     // test exercises the real event binding without displaying a test window.
     tk_.eval("wm geometry . +30000+30000; update");
@@ -454,8 +489,92 @@ void GoWindow::self_test() {
     }
     check(state_.is_terminal() && !mcts_mode_ && !search_ && mcts_job_.empty(), "MCTS second pass ends play and cancels search");
     check(tk_.eval("set status").find("Black wins") != std::string::npos, "MCTS terminal score displayed");
+
+    // A constant policy/value model gives reproducible PUCT tests without a
+    // checkpoint file or a claim about playing strength.
+    auto model = std::make_shared<PolicyValueNetwork>(NetworkSettings{9, 2, 3}, 0);
+    model->set_parameters(std::vector<double>(model->parameter_count(), 0.0));
+    network_ = model; neural_settings_ = {4, 1.5};
+    delay_ms_ = 1; max_moves_ = 500; new_game();
+    tk_.eval("update idletasks");
+    check(tk_.eval("winfo reqwidth .") == "608" && tk_.eval("winfo reqheight .") == "876", "neural controls preserve window size");
+    check(tk_.eval("expr {[winfo x .p.watch.mcts] + [winfo width .p.watch.mcts] <= [winfo width .p.watch]}") == "1", "neural controls fit the existing row");
+    check(tk_.eval(".p.watch.human cget -text") == "Play vs neural MCTS", "checkpoint enables neural controls");
+    tk_.eval(".p.watch.human invoke");
+    check(mcts_mode_ && neural_agent_ && !mcts_agent_ && !computer_turn(), "human starts Black against neural MCTS");
+    tk_.eval("event generate .p.board <Button-1> -x 52 -y 52");
+    before_search = state_;
+    check(computer_turn() && !mcts_job_.empty(), "human move schedules neural White");
+    check(tk_.eval(".p.buttons.pass cget -state") == "disabled", "pass blocked during neural search");
+    tk_.eval("event generate .p.board <Button-1> -x 110 -y 52");
+    check(state_ == before_search, "click blocked during neural search");
+    NeuralMctsAgent expected_neural(model, neural_settings_);
+    expected_move = expected_neural.choose_move(before_search);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (computer_turn()) {
+        tk_.eval("update");
+        check(std::chrono::steady_clock::now() < deadline, "neural response deadline");
+    }
+    check(state_ == before_search.play(expected_move) && history_.size() == 2, "incremental neural GUI matches agent");
+    check(!neural_search_ && mcts_job_.empty(), "completed neural search releases tree and timer");
+    check(tk_.eval("set notice").find("PUCT simulations") != std::string::npos &&
+          tk_.eval("set notice").find("network evaluations") != std::string::npos, "neural search status reports PUCT and inference");
+    tk_.eval(".p.watch.human invoke");
+    check(!mcts_mode_ && history_.size() == 2 && !neural_agent_, "stop neural retains position and releases agent");
+    delay_ms_ = 10000;
+    tk_.eval(".p.watch.human invoke; .p.buttons.pass invoke");
+    tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    check(neural_search_ && neural_search_->statistics().simulations == 1 && history_.size() == 1, "neural callback yields after exactly one simulation");
+    check(tk_.eval("set notice").find("1/4 PUCT simulations") != std::string::npos, "neural progress visible");
+    tk_.eval(".p.buttons.undo invoke; update");
+    check(!mcts_mode_ && !neural_search_ && !neural_agent_ && mcts_job_.empty() && history_.empty(), "undo cancels partial neural search");
+    tk_.eval(".p.watch.human invoke; .p.buttons.pass invoke");
+    tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    tk_.eval(".p.buttons.new invoke; update");
+    check(!neural_search_ && !neural_agent_ && !mcts_mode_ && history_.empty(), "reset cancels partial neural search");
+    tk_.eval(".p.watch.human invoke; .p.buttons.pass invoke");
+    stopped_position = state_;
+    tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    tk_.eval(".p.watch.human invoke; update");
+    check(!mcts_mode_ && !neural_search_ && !neural_agent_ && mcts_job_.empty() && state_ == stopped_position, "stop cancels partial neural search without move");
+    check(tk_.eval(".p.watch.mcts cget -text") == "Watch neural MCTS vs random", "neural watch label restored after stop");
+    tk_.eval(".p.watch.human invoke; .p.buttons.pass invoke");
+    tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    tk_.eval(".p.watch.random invoke");
+    check(!mcts_mode_ && !neural_search_ && !neural_agent_ && mcts_job_.empty() && !random_job_.empty(), "random mode cancels partial neural search");
+    tk_.eval(".p.watch.mcts invoke");
+    check(random_job_.empty() && mcts_mode_ && mcts_watch_ && neural_agent_, "neural watch cancels random playback");
+    tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    tk_.eval(".p.buttons.demo invoke");
+    check(!mcts_mode_ && !neural_search_ && !neural_agent_ && mcts_job_.empty() && !demo_job_.empty(), "demo cancels partial neural search");
+    max_moves_ = 2; delay_ms_ = 1;
+    tk_.eval(".p.watch.mcts invoke");
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (mcts_mode_) {
+        tk_.eval("update");
+        check(std::chrono::steady_clock::now() < deadline, "neural watch deadline");
+    }
+    NeuralMctsAgent expected_neural_black(model, neural_settings_); RandomAgent expected_neural_white(seed_ + 1);
+    auto expected_neural_watch = run_game([&](const GameState& s) { return expected_neural_black.choose_move(s); },
+                                        [&](const GameState& s) { return expected_neural_white.choose_move(s); }, 9, 7.5, max_moves_);
+    check(state_ == expected_neural_watch.final_state && history_.size() == expected_neural_watch.moves.size(), "neural watch runner parity");
+    check(random_truncated_ && !state_.is_terminal() && tk_.eval("set status").find("No final score") != std::string::npos, "neural watch move limit");
+    check(tk_.eval("after info").empty() && !neural_search_ && !neural_agent_, "neural watch cancels callbacks and search");
+    delay_ms_ = 10000; max_moves_ = 500;
+    tk_.eval(".p.watch.human invoke");
+    state_ = GameState(Board(9, std::vector<int>(9, BLACK)), WHITE, 7.5, 1);
+    schedule_mcts(); draw();
+    for (int i = 0; i < neural_settings_.simulations; ++i) {
+        tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    }
+    check(state_.is_terminal() && !mcts_mode_ && !neural_search_ && !neural_agent_ && mcts_job_.empty(), "neural second pass finishes and cancels search");
+    check(tk_.eval(".p.buttons.pass cget -state") == "disabled" && tk_.eval("set status").find("Black wins") != std::string::npos, "neural terminal score and controls");
+    tk_.eval(".p.watch.mcts invoke");
+    tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    check(neural_search_ && !mcts_job_.empty(), "partial neural tree before close");
     close();
-    std::cout << "GUI checks passed: clicks, passes, seeded playback, truncation, stop, undo, reset, demo, incremental MCTS, cancellation and close.\n";
+    check(!neural_search_ && !neural_agent_ && !mcts_mode_ && tk_.eval("after info").empty(), "close destroys partial neural tree and callbacks");
+    std::cout << "GUI checks passed: clicks, passes, seeded playback, truncation, stop, undo, reset, demo, incremental classical/neural MCTS, PUCT progress, cancellation and close.\n";
 }
 
 void GoWindow::dump_canvas(const std::filesystem::path& path) {

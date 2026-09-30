@@ -1,10 +1,12 @@
 #include "betago/arena.hpp"
 #include <algorithm>
-#include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -76,19 +78,38 @@ struct Performance {
     Count simulations = 0;
     Count completed_rollouts = 0;
     Count truncated_rollouts = 0;
+    Count rollout_simulations = 0;
+    Count neural_searches = 0;
+    Count network_evaluations = 0;
+    Count terminal_evaluations = 0;
     double decision_seconds = 0;
     double search_seconds = 0;
 
     void add(const Json& decision) {
         ++moves;
         decision_seconds += seconds_field(decision, "elapsed_seconds");
+        if (decision.contains("network_evaluations"))
+            network_evaluations += count_field(decision, "network_evaluations");
         if (!decision.contains("search")) return;
         const auto& search = decision.at("search");
         Count count = count_field(search, "simulations");
         Count completed = count_field(search, "completed_rollouts");
         Count truncated = count_field(search, "truncated_rollouts");
-        if (completed > count || truncated != count - completed)
-            throw std::invalid_argument("Arena rollout counts must sum to simulation count");
+        const auto algorithm = search.value("algorithm", std::string("uct"));
+        if (algorithm == "uct") {
+            if (completed > count || truncated != count - completed)
+                throw std::invalid_argument("Arena rollout counts must sum to simulation count");
+            rollout_simulations += count;
+        } else if (algorithm == "puct") {
+            const auto network = count_field(search, "network_evaluations");
+            const auto terminal = count_field(search, "terminal_evaluations");
+            if (count == std::numeric_limits<Count>::max() || completed || truncated ||
+                network > count + 1 || terminal != count + 1 - network)
+                throw std::invalid_argument("Arena PUCT evaluations must sum to simulations plus root initialization");
+            ++neural_searches;
+            network_evaluations += network;
+            terminal_evaluations += terminal;
+        } else throw std::invalid_argument("Arena search algorithm must be uct or puct");
         ++searches;
         simulations += count;
         completed_rollouts += completed;
@@ -107,7 +128,13 @@ struct Performance {
         object["completed_rollouts"] = completed_rollouts;
         object["truncated_rollouts"] = truncated_rollouts;
         object["rollout_truncation_rate"] = ratio(static_cast<double>(truncated_rollouts),
-                                                 static_cast<double>(simulations));
+                                                 static_cast<double>(rollout_simulations));
+        if (network_evaluations || terminal_evaluations || neural_searches) {
+            object["neural_searches"] = neural_searches;
+            object["network_evaluations"] = network_evaluations;
+            object["terminal_evaluations"] = terminal_evaluations;
+            object["rollout_simulations"] = rollout_simulations;
+        }
     }
 };
 
@@ -152,28 +179,95 @@ Json paired_interval(double value_sum, Count sample_size) {
             {"assumption", "independent seed pairs"}};
 }
 
-ArenaAgent make_agent(const AgentConfiguration& configuration, std::int64_t seed) {
-    if (configuration.kind == "random") {
-        auto agent = std::make_shared<RandomAgent>(seed);
-        return [agent](const GameState& state) { return ArenaDecision{agent->choose_move(state), std::nullopt}; };
-    }
-    auto agent = std::make_shared<MctsAgent>(configuration.search, seed);
-    return [agent](const GameState& state) {
-        Move move = agent->choose_move(state);
-        return ArenaDecision{move, agent->last_search()};
-    };
+std::string checkpoint_bytes(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::invalid_argument("Cannot open checkpoint " + path.string());
+    std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (input.bad()) throw std::invalid_argument("Cannot read checkpoint " + path.string());
+    return bytes;
+}
+
+std::string fnv1a64(const std::string& bytes) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char byte : bytes) { hash ^= byte; hash *= 1099511628211ULL; }
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return out.str();
 }
 } // namespace
 
 void AgentConfiguration::validate() const {
-    if (kind != "random" && kind != "mcts")
-        throw std::invalid_argument("Arena agent must be random or mcts");
+    if (kind != "random" && kind != "mcts" && kind != "policy" && kind != "neural-mcts")
+        throw std::invalid_argument("Agent must be random, mcts, policy, or neural-mcts");
     search.validate();
+    if (kind == "neural-mcts") neural.validate();
+    const bool uses_network = kind == "policy" || kind == "neural-mcts";
+    if (uses_network && checkpoint.empty()) throw std::invalid_argument(kind + " requires a checkpoint");
+    if (!uses_network && !checkpoint.empty()) throw std::invalid_argument(kind + " does not use a checkpoint");
 }
 
 Json AgentConfiguration::to_json() const {
     Json result = {{"kind", kind}};
     if (kind == "mcts") result["search"] = mcts_settings_json(search);
+    if (kind == "neural-mcts") result["search"] = neural_mcts_settings_json(neural);
+    if (!checkpoint.empty()) result["checkpoint"] = checkpoint;
+    return result;
+}
+
+PreparedAgent prepare_agent(const AgentConfiguration& configuration, int board_size) {
+    configuration.validate();
+    if (board_size < 1) throw std::invalid_argument("Board size must be positive");
+    PreparedAgent prepared{configuration, {}, nullptr};
+    if (configuration.checkpoint.empty()) return prepared;
+    const auto before = checkpoint_bytes(configuration.checkpoint);
+    auto network = PolicyValueNetwork::load(configuration.checkpoint);
+    if (before != checkpoint_bytes(configuration.checkpoint))
+        throw std::invalid_argument("Checkpoint changed while loading; retry with a stable file");
+    if (network.settings().board_size != board_size)
+        throw std::invalid_argument("Checkpoint board size does not match requested board size");
+    network.train(false);
+    const auto& settings = network.settings();
+    prepared.checkpoint_metadata = {
+        {"path", std::filesystem::absolute(configuration.checkpoint).lexically_normal().string()},
+        {"fingerprint_algorithm", "fnv1a64"}, {"content_fingerprint", fnv1a64(before)},
+        {"feature_schema", FEATURE_SCHEMA}, {"board_size", settings.board_size},
+        {"channels", settings.channels}, {"value_hidden", settings.value_hidden},
+        {"initialization_seed", network.initialization_seed()},
+        {"training_steps", network.training_steps()}, {"parameter_count", network.parameter_count()}};
+    prepared.network = std::make_shared<const PolicyValueNetwork>(std::move(network));
+    return prepared;
+}
+
+ArenaAgent PreparedAgent::create(std::int64_t seed) const {
+    if (configuration.kind == "random") {
+        auto agent = std::make_shared<RandomAgent>(seed);
+        return [agent](const GameState& state) { return ArenaDecision{agent->choose_move(state), std::nullopt, std::nullopt}; };
+    }
+    if (configuration.kind == "mcts") {
+        auto agent = std::make_shared<MctsAgent>(configuration.search, seed);
+        return [agent](const GameState& state) {
+            Move move = agent->choose_move(state);
+            return ArenaDecision{move, agent->last_search(), std::nullopt};
+        };
+    }
+    if (!network) throw std::invalid_argument("Neural agent has no prepared checkpoint");
+    if (configuration.kind == "policy") {
+        auto agent = std::make_shared<PolicyAgent>(network);
+        return [agent](const GameState& state) {
+            Move move = agent->choose_move(state);
+            return ArenaDecision{move, std::nullopt, agent->last_prediction()};
+        };
+    }
+    auto agent = std::make_shared<NeuralMctsAgent>(network, configuration.neural);
+    return [agent](const GameState& state) {
+        Move move = agent->choose_move(state);
+        return ArenaDecision{move, agent->last_search(), std::nullopt};
+    };
+}
+
+Json PreparedAgent::to_json() const {
+    auto result = configuration.to_json();
+    if (!checkpoint_metadata.is_null()) result["checkpoint_identity"] = checkpoint_metadata;
     return result;
 }
 
@@ -195,16 +289,32 @@ Json search_statistics_json(const SearchStatistics& statistics) {
         Json move = child.move ? Json::array({child.move->row, child.move->column}) : Json(nullptr);
         children.push_back({{"move", move}, {"visits", child.visits},
                             {"value_sum_for_child_player", child.value_sum}});
+        if (statistics.algorithm == "puct") children.back()["prior"] = child.prior;
     }
-    return {{"simulations", statistics.simulations}, {"root_visits", statistics.root_visits},
+    Json result = {{"simulations", statistics.simulations}, {"root_visits", statistics.root_visits},
             {"root_value_sum", statistics.root_value_sum}, {"completed_rollouts", statistics.completed_rollouts},
             {"truncated_rollouts", statistics.truncated_rollouts}, {"elapsed_seconds", statistics.elapsed_seconds},
             {"simulations_per_second", statistics.simulations_per_second()}, {"children", children}};
+    if (statistics.algorithm == "puct") {
+        result["algorithm"] = statistics.algorithm;
+        result["network_evaluations"] = statistics.network_evaluations;
+        result["terminal_evaluations"] = statistics.terminal_evaluations;
+    }
+    return result;
 }
 
 Json mcts_settings_json(const MctsSettings& settings) {
     return {{"simulations", settings.simulations}, {"exploration", settings.exploration},
             {"rollout_limit", settings.rollout_limit}, {"truncated_rollout_value", 0}};
+}
+
+Json neural_mcts_settings_json(const NeuralMctsSettings& settings) {
+    return {{"simulations", settings.simulations}, {"c_puct", settings.c_puct},
+            {"algorithm", "puct"}, {"leaf_value_perspective", "player_to_move"}};
+}
+
+Json prediction_json(const Prediction& prediction) {
+    return {{"probabilities", prediction.policy}, {"value_for_player_to_move", prediction.value}};
 }
 
 Json summarize_arena(const Json& games) {
@@ -287,13 +397,15 @@ Json run_arena(const ArenaSettings& settings, const Json& metadata,
     settings.validate();
     if (!metadata.is_object()) throw std::invalid_argument("Arena metadata must be an object");
     Json games = Json::array();
-    const ArenaAgentFactory create = factory ? factory : ArenaAgentFactory(make_agent);
+    const auto prepared_a = prepare_agent(settings.a, settings.size);
+    const auto prepared_b = prepare_agent(settings.b, settings.size);
     for (int pair = 0; pair < settings.pairs; ++pair) {
         std::int64_t a_seed = settings.seed + 2LL * pair, b_seed = a_seed + 1;
         for (int game_in_pair = 1; game_in_pair <= 2; ++game_in_pair) {
             // A new closure owns a new RNG for each game, preserving identical
             // identity seeds after the colors change without sharing RNG state.
-            ArenaAgent a = create(settings.a, a_seed), b = create(settings.b, b_seed);
+            ArenaAgent a = factory ? factory(settings.a, a_seed) : prepared_a.create(a_seed);
+            ArenaAgent b = factory ? factory(settings.b, b_seed) : prepared_b.create(b_seed);
             if (!a || !b) throw std::invalid_argument("Arena factory returned an empty agent");
             bool a_black = game_in_pair == 1;
             Json decisions = Json::array();
@@ -306,6 +418,10 @@ Json run_arena(const ArenaSettings& settings, const Json& metadata,
                 Json record = {{"move_number", ++move_number}, {"player", state.to_play()},
                                {"agent", use_a ? "a" : "b"}, {"elapsed_seconds", elapsed}};
                 if (decision.search) record["search"] = search_statistics_json(*decision.search);
+                if (decision.prediction) {
+                    record["policy"] = prediction_json(*decision.prediction);
+                    record["network_evaluations"] = 1;
+                }
                 decisions.push_back(std::move(record));
                 return decision.move;
             };
@@ -323,7 +439,7 @@ Json run_arena(const ArenaSettings& settings, const Json& metadata,
         }
     }
     return {{"schema_version", 1}, {"mode", "arena"}, {"seed", settings.seed},
-            {"agents", {{"a", settings.a.to_json()}, {"b", settings.b.to_json()}}},
+            {"agents", {{"a", prepared_a.to_json()}, {"b", prepared_b.to_json()}}},
             {"settings", {{"pairs", settings.pairs}, {"size", settings.size},
                           {"komi", settings.komi}, {"max_moves", settings.max_moves}}},
             {"rules", "simple ko, no suicide, area scoring, no dead-group adjudication"},

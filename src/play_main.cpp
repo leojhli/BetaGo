@@ -5,28 +5,52 @@
 int main(int argc, char** argv) {
     using namespace betago;
     try {
-        Options args(argc, argv, {"--seed", "--max-moves", "--delay-ms", "--dump-canvas", "--simulations", "--rollout-limit", "--exploration"},
-            {"--random", "--mcts", "--watch-mcts", "--help", "--self-test"});
+        Options args(argc, argv, {"--seed", "--max-moves", "--delay-ms", "--dump-canvas", "--simulations", "--rollout-limit", "--exploration", "--checkpoint", "--c-puct"},
+            {"--random", "--mcts", "--watch-mcts", "--neural", "--watch-neural", "--help", "--self-test"});
         if (args.has("--help")) {
-            std::cout << "BetaGo visual 9x9 board\nplay.exe [--random | --mcts | --watch-mcts] [--seed 0]\n"
+            std::cout << "BetaGo visual 9x9 board\nplay.exe [--random | --mcts | --watch-mcts | --neural | --watch-neural] [--seed 0]\n"
                       << "         [--max-moves 500] [--delay-ms 500] [--simulations 128]\n"
                       << "         [--rollout-limit 200] [--exploration 1.4142135623730951]\n"
-                      << "--mcts: play Black against MCTS White; --watch-mcts: MCTS Black vs random White\n";
+                      << "         [--checkpoint results/policy_value.json] [--c-puct 1.5]\n"
+                      << "--mcts: play Black against MCTS White; --watch-mcts: MCTS Black vs random White\n"
+                      << "--neural and --watch-neural use a required 9x9 checkpoint with PUCT search.\n"
+                      << "A checkpoint without a startup flag enables the neural MCTS buttons in local play.\n";
             return 0;
         }
         int limit = args.integer("--max-moves", 500), delay = args.integer("--delay-ms", 500);
         if (limit < 1 || delay < 1) throw std::invalid_argument("Move limit and delay must be positive");
-        if (int(args.has("--random")) + int(args.has("--mcts")) + int(args.has("--watch-mcts")) > 1)
-            throw std::invalid_argument("Choose one of --random, --mcts, or --watch-mcts");
+        if (int(args.has("--random")) + int(args.has("--mcts")) + int(args.has("--watch-mcts")) +
+            int(args.has("--neural")) + int(args.has("--watch-neural")) > 1)
+            throw std::invalid_argument("Choose one startup mode: --random, --mcts, --watch-mcts, --neural, or --watch-neural");
+        if ((args.has("--neural") || args.has("--watch-neural")) && !args.has("--checkpoint"))
+            throw std::invalid_argument("Neural MCTS requires --checkpoint");
+        if (args.has("--checkpoint") && (args.has("--mcts") || args.has("--watch-mcts")))
+            throw std::invalid_argument("Use --neural or --watch-neural with --checkpoint");
+        if (args.has("--checkpoint") && (args.has("--rollout-limit") || args.has("--exploration")))
+            throw std::invalid_argument("Neural MCTS uses --c-puct, not --rollout-limit or --exploration");
+        if (args.has("--c-puct") && !args.has("--checkpoint"))
+            throw std::invalid_argument("--c-puct requires --checkpoint");
         MctsSettings settings{args.integer("--simulations", 128), args.real("--exploration", 1.4142135623730951), args.integer("--rollout-limit", 200)};
         settings.validate();
-        GoWindow window(args.integer<std::int64_t>("--seed", 0), limit, delay, settings);
+        NeuralMctsSettings neural_settings{settings.simulations, args.real("--c-puct", 1.5)};
+        std::shared_ptr<const PolicyValueNetwork> network;
+        if (args.has("--checkpoint")) {
+            neural_settings.validate();
+            auto loaded = std::make_shared<PolicyValueNetwork>(PolicyValueNetwork::load(args.text("--checkpoint")));
+            if (loaded->settings().board_size != 9)
+                throw std::invalid_argument("The visual board requires a 9x9 checkpoint");
+            loaded->train(false);
+            network = std::move(loaded);
+        }
+        GoWindow window(args.integer<std::int64_t>("--seed", 0), limit, delay, settings, std::move(network), neural_settings);
         if (args.has("--self-test")) window.self_test();
         else if (args.has("--dump-canvas")) window.dump_canvas(args.text("--dump-canvas"));
         else {
             if (args.has("--random")) window.start_random();
             else if (args.has("--mcts")) window.start_mcts();
             else if (args.has("--watch-mcts")) window.start_mcts(true);
+            else if (args.has("--neural")) window.start_mcts();
+            else if (args.has("--watch-neural")) window.start_mcts(true);
             window.run();
         }
         return 0;

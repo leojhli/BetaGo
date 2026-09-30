@@ -5,8 +5,8 @@ checks, area scoring, seeded random agents, and classical Monte Carlo tree
 search (MCTS). The long-term goal is a small self-learning Go engine inspired by
 [KataGo](https://github.com/lightvector/KataGo).
 Currently it provides the rules environment, random and MCTS play, game
-recording, search statistics, an arena for repeatable agent comparisons, and
-a small CPU policy/value network with an explicit C++ training implementation.
+recording, search statistics, an arena for repeatable agent comparisons, a
+small CPU policy/value network, and neural MCTS guided by its policy and value.
 
 ## Build
 
@@ -46,8 +46,8 @@ ctest --test-dir out -C Release --output-on-failure
 ```
 
 For a Windows CMake build, copy `build/runtime/` beside the generated `play.exe`
-before running the visual board or its tests. The rules library, runner, and
-rules tests are portable C++; the current GUI loader and helper build script
+before running the visual board or its tests. The rules, network, search,
+runner, and native tests are portable C++; the current GUI loader and helper build script
 target Windows.
 
 ## Play on screen
@@ -96,10 +96,12 @@ These commands run games and replay final boards in the terminal:
 
 Both players default to `random`, choosing uniformly from all legal actions,
 including pass. Select `--black mcts` or `--white mcts` to use search for either
-player; each option accepts `random` or `mcts`. Each agent owns its generator.
+player; each option also accepts `policy` or `neural-mcts` with a checkpoint
+as described below. Random and classical MCTS agents each own their generator.
 The batch assigns Black `seed + 2 * game_index` and White the next integer,
 starting at game index zero. Seeds are signed 64-bit integers. Repeating settings
-reproduces moves and outcomes; elapsed time varies. Existing seeded games and
+reproduces moves and outcomes; elapsed time varies. Neural agents use fixed
+checkpoint predictions and deterministic ties. Existing seeded games and
 JSON records remain compatible.
 
 MCTS settings apply to both search agents: `--simulations 128` sets the exact
@@ -140,7 +142,8 @@ Start with a small board and modest search budget:
 ```
 
 Agent A defaults to `mcts` and B to `random`. Select either with
-`--agent-a random|mcts` and `--agent-b random|mcts`. Compare two search budgets
+`--agent-a` and `--agent-b`; both also accept `policy` and `neural-mcts` with a
+checkpoint. Compare two classical search budgets
 with:
 
 ```powershell
@@ -218,16 +221,16 @@ fingerprint of the authored code, build timestamp, compiler, flags, profile,
 and C++ standard. It also records the run timestamp, host name, OS family,
 architecture, available CPU identifier, and hardware-thread count. Unavailable
 machine and Git values are `null`. Keep this metadata with comparison results
-so later changes to code or machines are visible. The arena evaluates the
-random and classical MCTS agents. The network is trained separately; neural
-search, self-play training, and reinforcement learning are future work.
+so later changes to code or machines are visible. The arena evaluates random,
+classical MCTS, direct policy, and neural MCTS agents. The network is trained
+separately; self-play reinforcement learning remains future work.
 
 ## Train the policy/value network
 
 The network is implemented in C++20 using the standard library. Forward passes,
 backpropagation, and SGD with momentum run on the CPU, with no ML runtime or GPU
 installation. This small implementation is intended for study and correctness
-checks. It does not yet choose moves in the visual board or MCTS.
+checks. Its checkpoint can also guide neural MCTS in the visual board and arena.
 
 Generate nine scripted 9x9 capture-and-pass examples, then fit them:
 
@@ -313,6 +316,102 @@ weights. Gradients from both heads add in the shared trunk. SGD updates
 explicit: prediction is identical in either mode, and updates require train
 mode. Checkpoints reject incompatible shapes, schemas, and nonfinite numbers.
 
+## Use neural MCTS
+
+Load the saved 9x9 checkpoint to play against neural MCTS on the same wooden
+board, or watch it play random White:
+
+```powershell
+.\build\play.exe --neural --checkpoint results/policy_value.json --simulations 128
+.\build\play.exe --watch-neural --checkpoint results/policy_value.json --simulations 128 --seed 10
+```
+
+Human play starts as Black. The checkpoint switches the existing search
+buttons to **Play vs neural MCTS** and **Watch neural MCTS vs random**.
+Using only `--checkpoint` opens local play with those buttons available.
+Omit the checkpoint to use the original classical MCTS buttons. The board,
+window dimensions, pass/undo/reset controls, capture demo, and random playback
+are preserved. One PUCT simulation runs per Tk callback; stopping, undoing,
+resetting, switching modes, or closing cancels the partial tree and timer.
+The status shows simulations and network evaluations. `--c-puct 1.5` controls
+neural exploration; `--exploration` and `--rollout-limit` belong to classical
+search. The visual board requires a 9x9 checkpoint.
+
+The runner accepts four agent kinds: `random`, `mcts`, `policy`, and
+`neural-mcts`. `policy` selects the highest legal network probability in one
+inference. `neural-mcts` performs PUCT search and chooses the most visited root
+action. For example:
+
+```powershell
+.\build\runner.exe --black neural-mcts --white random --checkpoint results/policy_value.json --size 9 --simulations 16 --max-moves 30 --seed 10 --output results/neural_games.json
+.\build\runner.exe --replay results/neural_games.json
+.\build\runner.exe --benchmark --agent neural-mcts --checkpoint results/policy_value.json --size 9 --simulations 128 --output results/neural_search.json
+```
+
+For comparisons using the same checkpoint and rules:
+
+```powershell
+.\build\runner.exe --arena --agent-a policy --agent-b neural-mcts --checkpoint results/policy_value.json --size 9 --komi 0.5 --pairs 2 --simulations 16 --max-moves 30 --seed 10 --output results/policy_vs_neural.json
+.\build\runner.exe --arena --agent-a neural-mcts --agent-b mcts --checkpoint results/policy_value.json --size 9 --komi 0.5 --pairs 2 --a-simulations 16 --b-simulations 16 --b-rollout-limit 20 --max-moves 30 --seed 10 --output results/neural_vs_classical.json
+```
+
+These short runs check comparison and replay, with truncations reported as
+unfinished games. The demo checkpoint memorized nine scripted examples and
+has no broad training. Neural search is therefore a functional foundation,
+without an established playing-strength improvement. Equal simulation counts
+also represent different work for random rollouts and network evaluations.
+The existing complete-pair uncertainty bounds and color exchange still apply.
+Self-play generation, exploration noise, training on search visits, and candidate
+checkpoint promotion are not implemented yet.
+
+`--checkpoint` supplies a model to neural agents without an explicit override.
+Normal batches can use `--black-checkpoint` and `--white-checkpoint`; the arena
+can use `--a-checkpoint` and `--b-checkpoint` to compare different models.
+`--simulations` is a common search-budget fallback, with arena overrides
+`--a-simulations` / `--b-simulations`. Neural exploration can be overridden by
+`--a-c-puct` / `--b-c-puct`. Agent-specific options must match their mode, and
+unused checkpoint or PUCT options are rejected. All checkpoint sizes are
+checked before play begins. Evaluation loads immutable snapshots and makes
+no optimizer updates.
+
+Saved neural configurations include checkpoint path, dimensions, feature
+schema, initialization seed, training update count, parameter count, and a
+content fingerprint labeled `fnv1a64`. This fingerprint identifies the input
+file for reproducibility; it is not a cryptographic authenticity check. Search
+records include every legal root action, its prior, visits, and value sum for
+the child player. Policy-only records include legal probabilities and value
+for the player to move. The arena separates network and exact terminal
+evaluations from classical rollout completion/cutoff counts. With no rollout
+work, the rollout truncation rate is `null`.
+
+PUCT adds a policy-guided exploration bonus to each move's estimated value:
+
+```text
+score = -W_child / N_child + c_puct * P_child * sqrt(N_parent + 1) / (N_child + 1)
+```
+
+An unvisited child uses value zero. `P_child` is the network policy after
+illegal actions are masked and legal weights are normalized. The `+1` in the
+parent term gives priors an effect on the first simulation. Increasing visits
+reduces a child's exploration bonus. Unlike UCT, PUCT can revisit a promising
+move before visiting every root action.
+
+A search first infers and expands the root, without adding a visit. Each
+simulation then selects children until it reaches an unexpanded leaf or a
+terminal position. A nonterminal leaf supplies its policy and current-player
+value from the network; a terminal leaf uses the exact rules result and skips
+inference. Backup increments visits and negates value at each parent. The root
+inference is included in search time and evaluation counts: network plus
+terminal evaluations equals simulations plus one. No random rollouts occur.
+
+Final move selection uses the most visits, then the largest prior, then legal
+row-major order with pass last. Selection score ties use that same legal order.
+Inference and search are deterministic for a fixed checkpoint and settings;
+identity seeds continue to control random agents and classical MCTS. There is
+no self-play noise or temperature sampling. All-zero legal policy weights fall
+back to uniform legal priors; invalid shapes, negative/nonfinite weights, and
+out-of-range values are rejected.
+
 ## How search chooses a move
 
 MCTS builds a fresh tree for each decision. A node holds a position separately
@@ -386,6 +485,12 @@ masked probabilities, stable cross-entropy, central finite-difference gradients,
 shared-head gradients, batch averaging, optimizer updates, tiny-dataset fitting,
 and checkpoint prediction/optimizer equivalence. They use small deterministic
 examples rather than a playing-strength assertion.
+PUCT tests use controlled policies and values to check masking, exploration,
+alternating backups, exact terminal outcomes, inference counts, incremental
+parity, legal outputs, and model lifetime. Neural arena tests check checkpoint
+snapshots, replay, color exchange, deterministic games, and separate inference
+and rollout accounting. GUI checks also exercise partial neural-search
+cancellation and verify the original dimensions and canvas.
 
 ## Rules contract
 
@@ -443,7 +548,14 @@ shape and values, rather than proving the position arose through legal play.
 15. Read [tests/test_neural.cpp](tests/test_neural.cpp) to compare analytical
     derivatives with finite differences. Trace checkpoint save/load and repeat
     the same next batch to understand why optimizer history matters.
+16. Read [src/neural_mcts.cpp](src/neural_mcts.cpp): trace legal prior
+    normalization, PUCT selection, leaf evaluation, and alternating backup.
+    Compare those steps with classical `MctsSearch::simulate`.
+17. Predict the root value after two passes on a 1x1 board, then check the
+    controlled examples in [tests/test_neural_mcts.cpp](tests/test_neural_mcts.cpp).
+    Follow `prepare_agent` in [src/arena.cpp](src/arena.cpp) to see how evaluation
+    freezes a checkpoint before creating the agents.
 
 The C++ port deliberately keeps flood fills, explicit state copies, and a single
-legality definition. Future optimization should follow measurements. Neural
-MCTS and self-play reinforcement learning are not implemented yet.
+legality definition. Future optimization should follow measurements. Self-play
+reinforcement learning is not implemented yet.
