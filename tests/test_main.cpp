@@ -9,6 +9,7 @@
 using namespace betago;
 int run_mcts_tests();
 int run_arena_tests();
+int run_neural_tests();
 
 void check(bool condition, const std::string& message = "Unexpected result") {
     if (!condition) throw std::runtime_error(message);
@@ -277,5 +278,6 @@ int main(int argc, char** argv) {
     std::cout << suite.passed << " passed, " << suite.failed << " failed\n";
     int search_failures = run_mcts_tests();
     int arena_failures = run_arena_tests();
-    return suite.failed || search_failures || arena_failures ? 1 : 0;
+    int neural_failures = run_neural_tests();
+    return suite.failed || search_failures || arena_failures || neural_failures ? 1 : 0;
 }

@@ -5,7 +5,8 @@ checks, area scoring, seeded random agents, and classical Monte Carlo tree
 search (MCTS). The long-term goal is a small self-learning Go engine inspired by
 [KataGo](https://github.com/lightvector/KataGo).
 Currently it provides the rules environment, random and MCTS play, game
-recording, search statistics, and an arena for repeatable agent comparisons.
+recording, search statistics, an arena for repeatable agent comparisons, and
+a small CPU policy/value network with an explicit C++ training implementation.
 
 ## Build
 
@@ -15,8 +16,8 @@ On this Windows machine, run from the repository root:
 .\build.ps1
 ```
 
-The script builds optimized `build/play.exe`, `build/runner.exe`, and
-`build/tests.exe`. On its first run it downloads a pinned portable C++ compiler
+The script builds optimized `build/play.exe`, `build/runner.exe`,
+`build/network.exe`, and `build/tests.exe`. On its first run it downloads a pinned portable C++ compiler
 into `.tools/` and verifies the archive's checksum. Nothing is installed globally.
 Later builds reuse the compiler and unchanged object files. Use `-DebugBuild`
 for an unoptimized build with debug information.
@@ -217,9 +218,100 @@ fingerprint of the authored code, build timestamp, compiler, flags, profile,
 and C++ standard. It also records the run timestamp, host name, OS family,
 architecture, available CPU identifier, and hardware-thread count. Unavailable
 machine and Git values are `null`. Keep this metadata with comparison results
-so later changes to code or machines are visible. The arena performs evaluation;
-neural networks, self-play training, and reinforcement learning are not yet
-implemented.
+so later changes to code or machines are visible. The arena evaluates the
+random and classical MCTS agents. The network is trained separately; neural
+search, self-play training, and reinforcement learning are future work.
+
+## Train the policy/value network
+
+The network is implemented in C++20 using the standard library. Forward passes,
+backpropagation, and SGD with momentum run on the CPU, with no ML runtime or GPU
+installation. This small implementation is intended for study and correctness
+checks. It does not yet choose moves in the visual board or MCTS.
+
+Generate nine scripted 9x9 capture-and-pass examples, then fit them:
+
+```powershell
+.\build\network.exe --make-demo results/neural_demo.json
+.\build\network.exe --train results/neural_demo.json --verify-fit
+.\build\network.exe --inspect results/policy_value.json --position results/neural_demo.json --example 0
+```
+
+Training prints losses and saves `results/policy_value.json` plus
+`results/neural_training.json`. The report includes initial/final losses,
+predictions, sampled training history, settings, and compiled source identity.
+The checkpoint contains dimensions, parameter layout and values, feature
+schema, train/eval mode, update count, momentum buffers, and the last optimizer
+settings. Inspecting without `--position` evaluates an empty board with komi 7.5;
+use `--komi` to change that inspection position.
+
+The demo's policy targets are the scripted actions, including pass. Its value
+targets are derived from the actual final winner under the rules engine, from
+each saved position's player-to-move perspective: win `+1`, loss `-1`, draw `0`.
+The examples use komi 0.5 and preserve the previous board for simple ko.
+Fitting these examples proves memorization and functioning gradients. It does
+not measure Go playing strength. The existing wooden GUI and classical agents
+continue to run with their previous commands.
+
+Defaults are 500 epochs, the full dataset per batch, eight convolution channels,
+16 hidden value units, seed 0, learning rate 0.02, momentum 0.9, and L2 zero.
+An epoch visits each example once; a smaller batch gives several updates per
+epoch. For example:
+
+```powershell
+.\build\network.exe --train results/neural_demo.json --epochs 500 --batch-size 3 --seed 10 --output results/small_batch.json --report results/small_batch_training.json
+.\build\network.exe --train results/neural_demo.json --resume results/policy_value.json --epochs 50 --output results/continued.json --report results/continued_training.json
+```
+
+`--channels`, `--value-hidden`, `--learning-rate`, `--momentum`, `--l2`,
+`--log-every`, `--output`, and `--report` customize training. A resumed checkpoint
+supplies its architecture and momentum history; training options supply the
+optimizer settings for the new run. The minibatch shuffle starts again from
+`--seed` on each invocation. Checkpoints preserve the next update for the same
+batch and optimizer, but do not save the CLI sampler's position. Full-batch
+continuation has no shuffle dependency. Outputs are overwritten, so choose
+distinct paths to retain experiments.
+
+`--verify-fit` requires mean policy KL at most 0.05, maximum per-example KL at
+most 0.15, value MSE at most 0.01, and maximum value error at most 0.2. KL compares
+the prediction with the target distribution, including soft targets. The
+command saves its results and exits 2 if this check fails; malformed inputs or
+invalid settings exit 1. These thresholds check the supplied training set.
+
+Inputs use seven contiguous channel-first planes. For one 9x9 position the
+shape is `[7, 9, 9]`; a packed batch has shape `[batch, 7, 9, 9]`:
+
+| Plane | Meaning |
+| --- | --- |
+| 0 | Current player's stones |
+| 1 | Opponent's stones |
+| 2 | Exact simple-ko forbidden placements |
+| 3 | Constant 1 after one consecutive pass, otherwise 0 |
+| 4 | Constant terminal flag after two passes |
+| 5 | Constant `tanh(signed_komi / board_area)`, with `+komi` for White and `-komi` for Black |
+| 6 | Legal placements, checked through the rules engine |
+
+Actions are row-major: `row * board_size + column`; pass is the final action
+at `board_size * board_size`. Legal-action masks exclude occupied points,
+suicide, and ko. Nonterminal pass is always legal. A terminal position has no
+legal actions and its policy is all zeros; its network value remains a learned
+prediction. Training targets must be nonterminal, finite, normalized, legal
+policy distributions and values in `[-1, 1]`.
+
+The shared trunk applies a 3x3 convolution with one-cell zero padding and ReLU,
+producing `[8, 9, 9]` by default. Flattening gives 648 activations. A dense policy
+head produces 82 logits and a stable softmax over legal actions only. A separate
+value head uses 16 ReLU units and a scalar tanh output. Board sizes 1 through 19
+are supported; each checkpoint fixes its board size. There are no residual
+blocks, dropout, or batch normalization in this first network.
+
+The objective is batch-mean policy cross-entropy plus batch-mean squared value
+error, plus optional `0.5 * l2 * sum(parameters^2)`. L2 includes biases as well as
+weights. Gradients from both heads add in the shared trunk. SGD updates
+`velocity = momentum * velocity + gradient`, then
+`parameter -= learning_rate * velocity`. Train/eval modes make update intent
+explicit: prediction is identical in either mode, and updates require train
+mode. Checkpoints reject incompatible shapes, schemas, and nonfinite numbers.
 
 ## How search chooses a move
 
@@ -289,6 +381,11 @@ Arena tests verify exchanged colors, identity seeds, fresh generators, exact
 W/L/D accounting, draws and truncations, per-color results, paired uncertainty,
 weighted timing, deterministic games, replay compatibility, and invalid
 settings using small controlled games.
+Neural tests check feature planes and ko history, action and batch shapes,
+masked probabilities, stable cross-entropy, central finite-difference gradients,
+shared-head gradients, batch averaging, optimizer updates, tiny-dataset fitting,
+and checkpoint prediction/optimizer equivalence. They use small deterministic
+examples rather than a playing-strength assertion.
 
 ## Rules contract
 
@@ -337,7 +434,16 @@ shape and values, rather than proving the position arose through legal play.
 12. Predict the totals for a pair of pass-only games before reading
     [tests/test_arena.cpp](tests/test_arena.cpp). Trace `summarize_arena` to see
     why two games contribute one independent sample to the uncertainty bounds.
+13. Trace `encode_position` in [src/features.cpp](src/features.cpp), then inspect
+    the raw positions and targets in the generated demo JSON. Follow
+    [src/dataset.cpp](src/dataset.cpp) to see how the final winner labels turns.
+14. Read [include/betago/network.hpp](include/betago/network.hpp), then trace
+    `forward`, `objective`, and `train_batch` in [src/network.cpp](src/network.cpp).
+    Match each parameter block's shape with the loops that use it.
+15. Read [tests/test_neural.cpp](tests/test_neural.cpp) to compare analytical
+    derivatives with finite differences. Trace checkpoint save/load and repeat
+    the same next batch to understand why optimizer history matters.
 
 The C++ port deliberately keeps flood fills, explicit state copies, and a single
 legality definition. Future optimization should follow measurements. Neural
-networks and training are not implemented yet.
+MCTS and self-play reinforcement learning are not implemented yet.

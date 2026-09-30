@@ -22,6 +22,11 @@ public:
     using std::invalid_argument::invalid_argument;
 };
 
+class KoViolation : public IllegalMove {
+public:
+    using IllegalMove::IllegalMove;
+};
+
 struct Score {
     double black, white;
     std::optional<int> winner() const;

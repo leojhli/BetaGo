@@ -98,7 +98,7 @@ GameState GameState::play(Move move) const {
     for (Point p : captured) result.board_[p.row][p.column] = EMPTY;
     if (result.group_and_liberties(*move).liberties.empty()) throw IllegalMove("Suicide is forbidden");
     if (previous_board_ && result.board_ == *previous_board_)
-        throw IllegalMove("Simple ko forbids immediate board repetition");
+        throw KoViolation("Simple ko forbids immediate board repetition");
     result.to_play_ = opponent;
     result.consecutive_passes_ = 0;
     result.previous_board_ = board_;
