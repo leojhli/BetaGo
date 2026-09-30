@@ -29,8 +29,8 @@ try {
     $taskFlagsChanged = -not (Test-Path $taskStamp) -or ((Get-Content $taskStamp -Raw).Trim() -ne $taskFlagSignature)
     $taskHeaderTime = (Get-ChildItem 'include', 'third_party' -Recurse -File | Where-Object { $_.Extension -in @('.h', '.hpp') } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
     $taskObjects = @{}
-    foreach ($taskName in @('state', 'random', 'runner', 'tk', 'window', 'runner_main', 'play_main', 'test_main')) {
-        $taskSource = if ($taskName -eq 'test_main') { 'tests/test_main.cpp' } else { "src/$taskName.cpp" }
+    foreach ($taskName in @('state', 'random', 'mcts', 'runner', 'tk', 'window', 'runner_main', 'play_main', 'test_main', 'test_mcts')) {
+        $taskSource = if ($taskName -in @('test_main', 'test_mcts')) { "tests/$taskName.cpp" } else { "src/$taskName.cpp" }
         $taskObject = "build/$taskName.o"
         if (-not $taskFlagsChanged -and (Test-Path $taskObject)) {
             $taskObjectTime = (Get-Item $taskObject).LastWriteTimeUtc
@@ -45,12 +45,12 @@ try {
         $taskObjects[$taskName] = $taskObject
     }
     Set-Content -LiteralPath $taskStamp -Value $taskFlagSignature
-    $taskCore = @($taskObjects.state, $taskObjects.random, $taskObjects.runner)
+    $taskCore = @($taskObjects.state, $taskObjects.random, $taskObjects.mcts, $taskObjects.runner)
     foreach ($taskTarget in @('runner', 'play', 'tests')) {
         $taskTargetObjects = switch ($taskTarget) {
             'runner' { $taskCore + @($taskObjects.runner_main) }
             'play' { $taskCore + @($taskObjects.tk, $taskObjects.window, $taskObjects.play_main) }
-            'tests' { $taskCore + @($taskObjects.test_main) }
+            'tests' { $taskCore + @($taskObjects.test_main, $taskObjects.test_mcts) }
         }
         Write-Host "Linking build/$taskTarget.exe"
         & $taskCompiler c++ @taskTargetObjects -o "build/$taskTarget.exe"

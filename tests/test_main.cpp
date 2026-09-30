@@ -7,6 +7,7 @@
 #include <limits>
 
 using namespace betago;
+int run_mcts_tests();
 
 void check(bool condition, const std::string& message = "Unexpected result") {
     if (!condition) throw std::runtime_error(message);
@@ -273,5 +274,6 @@ int main(int argc, char** argv) {
         }
     });
     std::cout << suite.passed << " passed, " << suite.failed << " failed\n";
-    return suite.failed ? 1 : 0;
+    int search_failures = run_mcts_tests();
+    return suite.failed || search_failures ? 1 : 0;
 }

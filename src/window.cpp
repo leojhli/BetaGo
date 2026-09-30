@@ -12,10 +12,11 @@
 
 namespace betago {
 const std::vector<Point> GoWindow::DEMO = {{0, 1}, {1, 1}, {1, 0}, {8, 8}, {2, 1}, {8, 7}, {1, 2}};
-GoWindow::GoWindow(std::int64_t seed, int max_moves, int delay_ms)
-    : seed_(seed), max_moves_(max_moves), delay_ms_(delay_ms), black_(seed), white_(0) {
+GoWindow::GoWindow(std::int64_t seed, int max_moves, int delay_ms, MctsSettings settings)
+    : seed_(seed), max_moves_(max_moves), delay_ms_(delay_ms), black_(seed), white_(0), mcts_settings_(settings) {
     if (max_moves < 1 || delay_ms < 1) throw std::invalid_argument("Move limit and delay must be positive");
     if (seed == std::numeric_limits<std::int64_t>::max()) throw std::invalid_argument("White's seed exceeds signed 64-bit range");
+    mcts_settings_.validate();
     tk_.command("betago", callback, this);
     tk_.eval(R"TK(
 wm title . {BetaGo - 9x9 Go}
@@ -57,6 +58,10 @@ ttk::frame .p.watch
 pack .p.watch -fill x -pady {8 0}
 ttk::button .p.watch.random -text {Watch random game} -command {betago random}
 pack .p.watch.random -side left
+ttk::button .p.watch.human -text {Play vs MCTS} -command {betago mcts}
+pack .p.watch.human -side left -padx 6
+ttk::button .p.watch.mcts -text {Watch MCTS vs random} -command {betago watch_mcts}
+pack .p.watch.mcts -side left
 ttk::label .p.footer -text {Finish captures before passing. Remaining stones count toward area.} -wraplength 540
 pack .p.footer -anchor w -pady {12 0}
 )TK");
@@ -81,13 +86,19 @@ void GoWindow::action(const std::vector<std::string>& args) {
     if (args.empty()) throw std::invalid_argument("Missing visual action");
     const auto& name = args[0];
     if (name == "click" && args.size() == 3) click(std::stoi(args[1]), std::stoi(args[2]));
-    else if (name == "pass") play(PASS);
+    else if (name == "pass") {
+        if (computer_turn()) notice("Wait for the computer's move, or stop MCTS to take over.");
+        else play(PASS);
+    }
     else if (name == "undo") undo();
     else if (name == "new") new_game();
     else if (name == "demo") toggle_demo();
     else if (name == "demo_step") demo_step();
     else if (name == "random") toggle_random();
     else if (name == "random_step") random_step();
+    else if (name == "mcts") toggle_mcts(false);
+    else if (name == "watch_mcts") toggle_mcts(true);
+    else if (name == "mcts_step") mcts_step();
     else if (name == "close") close();
     else throw std::invalid_argument("Unknown visual action");
 }
@@ -178,7 +189,7 @@ void GoWindow::draw() {
     else status << (state_.to_play() == BLACK ? "Black" : "White") << " to play  |  Move " << history_.size() + 1
                 << "  |  Passes " << state_.consecutive_passes() << "/2";
     out << "set status " << tcl_quote(status.str()) << '\n';
-    bool watching = !demo_job_.empty() || !random_job_.empty();
+    bool watching = !demo_job_.empty() || !random_job_.empty() || computer_turn();
     out << ".p.buttons.pass configure -state " << (state_.is_terminal() || watching ? "disabled" : "normal") << '\n';
     out << ".p.buttons.undo configure -state " << (history_.empty() ? "disabled" : "normal") << '\n';
     tk_.eval(out.str());
@@ -186,6 +197,7 @@ void GoWindow::draw() {
 
 void GoWindow::click(int x, int y) {
     if (!demo_job_.empty() || !random_job_.empty()) { notice("Stop playback to play your own moves."); return; }
+    if (computer_turn()) { notice("Wait for the computer's move, or stop MCTS to take over."); return; }
     int column = static_cast<int>(std::nearbyint((x - MARGIN) / double(SPACING)));
     int row = static_cast<int>(std::nearbyint((y - MARGIN) / double(SPACING)));
     if (row < 0 || row >= 9 || column < 0 || column >= 9) return;
@@ -208,7 +220,17 @@ void GoWindow::play(Move move) {
     else if (!move) notice("Passed. Another pass will end the game.");
     else if (captured) notice("Captured " + std::to_string(captured) + " stone(s). The empty intersections can be played again.");
     else if (!random_job_.empty()) notice("Random agents are choosing legal moves, including pass.");
+    else if (mcts_mode_) notice(mcts_watch_ ? "Watching MCTS (Black) vs random (White)." : "Your turn as Black. White uses MCTS.");
     else notice("Click an intersection to place a stone.");
+    if (mcts_mode_) {
+        if (state_.is_terminal()) {
+            stop_mcts(); mode("9 x 9   /   MCTS game finished   /   Komi 7.5");
+        } else if (mcts_watch_ && history_.size() >= static_cast<std::size_t>(max_moves_)) {
+            stop_mcts(); random_truncated_ = true;
+            mode("9 x 9   /   MCTS game truncated   /   Komi 7.5");
+            notice("Move limit reached. No final score. Continue playing or start a new game.");
+        } else schedule_mcts();
+    }
     draw();
 }
 
@@ -222,12 +244,12 @@ void GoWindow::stop_random() {
     mode("9 x 9   /   Local play   /   Komi 7.5");
 }
 void GoWindow::new_game() {
-    stop_demo(); stop_random();
+    stop_demo(); stop_random(); stop_mcts();
     state_ = GameState::new_game(); history_.clear(); last_move_.reset(); random_truncated_ = false;
     notice("Click an intersection to place a stone."); draw();
 }
 void GoWindow::undo() {
-    stop_demo(); stop_random(); random_truncated_ = false;
+    stop_demo(); stop_random(); stop_mcts(); random_truncated_ = false;
     if (!history_.empty()) {
         state_ = history_.back().first; last_move_ = history_.back().second; history_.pop_back(); notice("Move undone.");
     }
@@ -266,7 +288,52 @@ void GoWindow::random_step() {
     } else random_job_ = tk_.eval("after " + std::to_string(delay_ms_) + " {betago random_step}");
     draw();
 }
-void GoWindow::close() { stop_demo(); stop_random(); tk_.eval("destroy ."); }
+bool GoWindow::computer_turn() const {
+    return mcts_mode_ && !state_.is_terminal() && (mcts_watch_ || state_.to_play() == WHITE);
+}
+void GoWindow::stop_mcts() {
+    if (!mcts_job_.empty()) { tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_job_.clear(); }
+    // Searches borrow the agent's random generator, so destroy the search first.
+    search_.reset(); mcts_agent_.reset(); mcts_mode_ = mcts_watch_ = false;
+    tk_.eval(".p.watch.human configure -text {Play vs MCTS}; .p.watch.mcts configure -text {Watch MCTS vs random}");
+    mode("9 x 9   /   Local play   /   Komi 7.5");
+}
+void GoWindow::start_mcts(bool watch) { toggle_mcts(watch); }
+void GoWindow::toggle_mcts(bool watch) {
+    if (mcts_mode_ && mcts_watch_ == watch) {
+        stop_mcts(); notice("MCTS stopped. You can continue playing this position."); draw(); return;
+    }
+    new_game(); mcts_mode_ = true; mcts_watch_ = watch;
+    mcts_agent_ = std::make_unique<MctsAgent>(mcts_settings_, watch ? seed_ : seed_ + 1);
+    white_ = RandomAgent(seed_ + 1);
+    mode(std::string("9 x 9   /   ") + (watch ? "MCTS vs random" : "You (Black) vs MCTS") + "   /   Komi 7.5");
+    tk_.eval(watch ? ".p.watch.mcts configure -text {Stop MCTS game}" : ".p.watch.human configure -text {Stop MCTS}");
+    notice(watch ? "Watching MCTS (Black) vs random (White)." : "Your turn as Black. White uses MCTS.");
+    schedule_mcts(); draw();
+}
+void GoWindow::schedule_mcts() {
+    if (computer_turn() && mcts_job_.empty())
+        mcts_job_ = tk_.eval("after " + std::to_string(delay_ms_) + " {betago mcts_step}");
+}
+void GoWindow::mcts_step() {
+    mcts_job_.clear();
+    if (!computer_turn()) return;
+    if (mcts_watch_ && state_.to_play() == WHITE) { play(white_.choose_move(state_)); return; }
+    if (!search_) search_ = mcts_agent_->start_search(state_);
+    // Yield to Tk after each bounded rollout, so reset, undo and stop work
+    // throughout a search. The board is changed only when the budget is complete.
+    search_->step();
+    if (!search_->finished()) {
+        auto stats = search_->statistics();
+        notice("MCTS thinking: " + std::to_string(stats.simulations) + "/" + std::to_string(mcts_settings_.simulations) + " simulations.");
+        mcts_job_ = tk_.eval("after 1 {betago mcts_step}"); return;
+    }
+    auto move = search_->best_move(); auto stats = search_->statistics(); search_.reset();
+    play(move);
+    if (mcts_mode_) notice("Last search: " + std::to_string(stats.simulations) + " simulations, " +
+        std::to_string(stats.truncated_rollouts) + " rollouts cut off. " + (mcts_watch_ ? "Watching MCTS vs random." : "Your turn as Black."));
+}
+void GoWindow::close() { stop_demo(); stop_random(); stop_mcts(); tk_.eval("destroy ."); }
 
 void GoWindow::self_test() {
     // Tk ignores mouse events for an unmapped canvas. Map it off-screen so the
@@ -320,8 +387,75 @@ void GoWindow::self_test() {
     check(demo_job_.empty() && !random_job_.empty(), "switch to random game");
     stop_random();
     check(tk_.eval("after info").empty(), "cancel pending callbacks");
+    mcts_settings_ = {4, 1.4142135623730951, 2}; delay_ms_ = 1;
+    tk_.eval(".p.watch.human invoke");
+    check(mcts_mode_ && !computer_turn() && mcts_job_.empty(), "human starts as Black");
+    tk_.eval("event generate .p.board <Button-1> -x 52 -y 52");
+    auto before_search = state_;
+    check(computer_turn() && !mcts_job_.empty(), "human move starts White search");
+    check(tk_.eval(".p.buttons.pass cget -state") == "disabled", "pass blocked while computer thinks");
+    tk_.eval("event generate .p.board <Button-1> -x 110 -y 52");
+    check(state_ == before_search, "click blocked while computer thinks");
+    MctsAgent expected_mcts(mcts_settings_, seed_ + 1);
+    auto expected_move = expected_mcts.choose_move(before_search);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (computer_turn()) {
+        tk_.eval("update");
+        check(std::chrono::steady_clock::now() < deadline, "MCTS response deadline");
+    }
+    check(state_ == before_search.play(expected_move) && history_.size() == 2, "incremental GUI search matches seeded agent");
+    check(!search_ && mcts_job_.empty(), "completed search releases tree and timer");
+    tk_.eval(".p.watch.human invoke");
+    check(!mcts_mode_ && history_.size() == 2, "stop MCTS retains position");
+    // Cancel a partially explored tree through real controls. No result from
+    // the old position may arrive after undo, reset or a mode switch.
+    delay_ms_ = 10000;
+    tk_.eval(".p.watch.human invoke; .p.buttons.pass invoke");
+    tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    check(search_ && search_->statistics().simulations == 1, "incremental simulation yields before commit");
+    tk_.eval(".p.buttons.undo invoke");
+    check(!mcts_mode_ && !search_ && mcts_job_.empty() && history_.empty(), "undo cancels partial search");
+    tk_.eval(".p.watch.human invoke; .p.buttons.pass invoke");
+    tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    tk_.eval(".p.buttons.new invoke; update");
+    check(!search_ && !mcts_mode_ && history_.empty(), "reset cancels partial search");
+    tk_.eval(".p.watch.human invoke; .p.buttons.pass invoke");
+    auto stopped_position = state_;
+    tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    tk_.eval(".p.watch.human invoke; update");
+    check(!mcts_mode_ && !search_ && mcts_job_.empty() && state_ == stopped_position, "stop cancels partial search without committing a move");
+    tk_.eval(".p.watch.human invoke; .p.buttons.pass invoke; .p.watch.random invoke");
+    check(!mcts_mode_ && !search_ && mcts_job_.empty() && !random_job_.empty(), "random mode cancels MCTS");
+    tk_.eval(".p.watch.mcts invoke");
+    check(random_job_.empty() && mcts_mode_ && mcts_watch_, "MCTS mode cancels random playback");
+    tk_.eval(".p.buttons.demo invoke");
+    check(!mcts_mode_ && mcts_job_.empty() && !demo_job_.empty(), "demo cancels MCTS");
+    max_moves_ = 2; delay_ms_ = 1;
+    tk_.eval(".p.watch.mcts invoke");
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (mcts_mode_) {
+        tk_.eval("update");
+        check(std::chrono::steady_clock::now() < deadline, "MCTS watch deadline");
+    }
+    MctsAgent expected_black(mcts_settings_, seed_); RandomAgent expected_white(seed_ + 1);
+    auto expected_watch = run_game([&](const GameState& s) { return expected_black.choose_move(s); },
+                                  [&](const GameState& s) { return expected_white.choose_move(s); }, 9, 7.5, max_moves_);
+    check(state_ == expected_watch.final_state && history_.size() == expected_watch.moves.size(), "MCTS watch runner parity");
+    check(random_truncated_ && !state_.is_terminal(), "MCTS watch truncation");
+    check(tk_.eval("set status").find("No final score") != std::string::npos, "MCTS watch truncation message");
+    check(tk_.eval("after info").empty() && !search_, "MCTS cancels pending callbacks");
+    delay_ms_ = 10000; tk_.eval(".p.watch.mcts invoke; .p.watch.mcts invoke");
+    check(!mcts_mode_ && mcts_job_.empty(), "stop watched MCTS game");
+    tk_.eval(".p.watch.human invoke");
+    state_ = GameState(Board(9, std::vector<int>(9, BLACK)), WHITE, 7.5, 1);
+    schedule_mcts(); draw();
+    for (int i = 0; i < mcts_settings_.simulations; ++i) {
+        tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
+    }
+    check(state_.is_terminal() && !mcts_mode_ && !search_ && mcts_job_.empty(), "MCTS second pass ends play and cancels search");
+    check(tk_.eval("set status").find("Black wins") != std::string::npos, "MCTS terminal score displayed");
     close();
-    std::cout << "GUI checks passed: clicks, passes, seeded playback, truncation, stop, undo, reset, demo, close.\n";
+    std::cout << "GUI checks passed: clicks, passes, seeded playback, truncation, stop, undo, reset, demo, incremental MCTS, cancellation and close.\n";
 }
 
 void GoWindow::dump_canvas(const std::filesystem::path& path) {

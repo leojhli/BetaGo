@@ -1,9 +1,11 @@
 # BetaGo
 
 A C++20 Go engine with the same playable wooden 9x9 board, capture and legality
-checks, area scoring, and seeded random agents. The long-term goal is a small
-self-learning Go engine inspired by [KataGo](https://github.com/lightvector/KataGo).
-Currently it provides the rules environment, random play, and game recording.
+checks, area scoring, seeded random agents, and classical Monte Carlo tree
+search (MCTS). The long-term goal is a small self-learning Go engine inspired by
+[KataGo](https://github.com/lightvector/KataGo).
+Currently it provides the rules environment, random and MCTS play, game
+recording, and search statistics.
 
 ## Build
 
@@ -52,6 +54,8 @@ target Windows.
 ```powershell
 .\build\play.exe
 .\build\play.exe --random --seed 10
+.\build\play.exe --mcts --seed 10
+.\build\play.exe --watch-mcts --seed 10
 ```
 
 Click an intersection to play. Black and White alternate on the same computer.
@@ -61,13 +65,22 @@ on all four sides, shaded stones, and a contrasting ring around the last move.
 
 **Watch capture demo** plays the original short scripted capture sequence.
 **Watch random game** starts a game between two seeded random agents, one move
-at a time. Stop playback to continue the position yourself. Undo and New game
-also cancel playback.
+at a time. **Play vs MCTS** starts a game with human Black and MCTS White.
+**Watch MCTS vs random** starts MCTS Black against random White. The corresponding
+startup options are `--mcts` and `--watch-mcts`. MCTS runs one simulation per Tk
+callback so the board can process controls while thinking. The status shows
+search progress and rollout truncations.
 
-Use `--delay-ms 250` for faster random playback or `--max-moves 100` for a shorter
-limit. The visual board remains 9x9 with komi 7.5. A second pass displays the
-winner; the move limit displays truncation without a final score. Visual
-playback does not save JSON records.
+Stop playback to continue the position yourself. Undo, New game, and stopping
+also cancel an unfinished search and return to local two-player interaction.
+
+Use `--delay-ms 250` for a shorter pause between watched moves or
+`--max-moves 100` for a shorter watched game. Human games have no move limit.
+Search options are `--simulations 128`, `--rollout-limit 200`, and
+`--exploration 1.4142135623730951`; these values are the defaults. More
+simulations require more thinking time. The visual board remains 9x9 with komi
+7.5. A second pass displays the winner; the move limit displays truncation
+without a final score. Visual playback does not save JSON records.
 
 ## Run and replay batches
 
@@ -77,14 +90,23 @@ These commands run games and replay final boards in the terminal:
 .\build\runner.exe --size 3 --games 5 --seed 10 --max-moves 100 --output results/tiny.json
 .\build\runner.exe --size 9 --games 3 --seed 10 --max-moves 500 --output results/9x9.json
 .\build\runner.exe --replay results/9x9.json
+.\build\runner.exe --size 3 --black mcts --white random --simulations 128 --seed 10 --output results/mcts_games.json
 ```
 
-Both players choose uniformly from all legal actions, including pass. This is
-a baseline with no tactical judgment. Each random agent owns its generator.
+Both players default to `random`, choosing uniformly from all legal actions,
+including pass. Select `--black mcts` or `--white mcts` to use search for either
+player; each option accepts `random` or `mcts`. Each agent owns its generator.
 The batch assigns Black `seed + 2 * game_index` and White the next integer,
 starting at game index zero. Seeds are signed 64-bit integers. Repeating settings
 reproduces moves and outcomes; elapsed time varies. Existing seeded games and
 JSON records remain compatible.
+
+MCTS settings apply to both search agents: `--simulations 128` sets the exact
+number of simulations per move, `--rollout-limit 200` caps moves in each random
+rollout, and `--exploration 1.4142135623730951` sets UCT's exploration weight.
+Simulation counts must be positive; rollout limits and exploration weights
+must be nonnegative. A rollout limit of zero still evaluates terminal tree
+leaves exactly but immediately truncates nonterminal leaves.
 
 Each JSON record contains size, komi, move limit, both seeds, moves, game length
 (including passes), elapsed seconds, termination reason, score, and winner.
@@ -93,9 +115,65 @@ White, or `null` for a completed draw. `two_passes` marks completion;
 `move_limit` marks an unfinished game with `null` score and winner. A second pass
 on the last allowed action still completes the game.
 
+Batches record agent types and MCTS settings. Each search entry records its
+move number and player, simulations, root visits and accumulated value, active
+search time, simulation throughput, completed and truncated rollout counts,
+and root-child moves with visits and accumulated values. Child values use the
+child state's player perspective. Random-only games retain their existing
+record format.
+
 Replay checks legality and recorded outcomes using the rules engine. The output
 file is overwritten when running a batch; use different paths to keep
 experiments. Generated `results/` files are ignored by Git.
+
+## How search chooses a move
+
+MCTS builds a fresh tree for each decision. A node holds a position separately
+from its visit count `N` and accumulated value `W`. Values describe the player
+to move at that node: a terminal win is `+1`, a loss is `-1`, and a draw is `0`.
+
+Each simulation performs four steps:
+
+1. **Selection:** follow fully expanded nodes using UCT. Unvisited children
+   take priority; otherwise choose the largest value of
+   `-W_child / N_child + C * sqrt(log(N_parent) / N_child)`.
+2. **Expansion:** choose one unexpanded legal action uniformly, including pass,
+   and create its successor node.
+3. **Simulation:** play uniformly random legal actions from that leaf until
+   two passes end the game or the rollout limit is reached.
+4. **Backup:** add the result to every node on the selected path, incrementing
+   each visit count and negating the value at every parent step.
+
+The minus sign in selection converts the child's average to the parent's
+perspective. `C` controls exploration; less-visited children receive a larger
+exploration bonus. Backup negates values because the players alternate turns.
+After the simulation budget, choose the root child with the most visits.
+Visit-count ties choose the first expanded child without consuming randomness.
+
+Unfinished rollouts contribute zero as an approximation. These are recorded as
+truncations, not actual drawn games; a high truncation rate limits the
+information available to search. A terminal result reached on the final
+allowed rollout move is still evaluated exactly. Search does not use neural
+networks, learned values, or tactical rollout heuristics.
+
+The default 128 simulations is a modest educational budget. Initially a 9x9
+board has 82 legal actions including pass. Budgets at or below the number of
+legal actions only expand each sampled root action once, leaving visit-count
+ties and weak decisions. Larger budgets allow UCT to revisit actions and make
+deeper comparisons. A few wins against random play do not establish strength.
+
+Measure search on an empty board with:
+
+```powershell
+.\build\runner.exe --benchmark --size 9 --simulations 128 --seed 10
+.\build\runner.exe --benchmark --size 3 --simulations 500 --seed 10 --output results/tiny_search.json
+```
+
+This reports simulations per second and rollout truncations, saving settings,
+root-child statistics, and the selected move. The default output is
+`results/search_benchmark.json`. A benchmark file describes a single search;
+it is not a replayable game record. Timing counts active simulation work and
+excludes pauses between GUI callbacks.
 
 ## Run the tests
 
@@ -108,7 +186,10 @@ Or build and run both with `.\build.ps1 -Test`. Rules tests cover captures,
 shared liberties, suicide, ko, passes, scoring, immutable successors, seeded
 replay, move limits, and JSON validation. Migration fixtures preserve 98 original
 positions and four original seeded games, including negative and large seeds.
-The GUI checks exercise real Tk events and controls in a hidden window.
+Search tests cover hand-scored UCT choices, alternating backup signs, terminal
+rewards, exact simulation counts, rollout cutoffs, legal outputs, unchanged input
+states, deterministic seeds, and equivalent incremental searches. The GUI
+checks exercise real Tk events and controls in a hidden window.
 
 ## Rules contract
 
@@ -142,11 +223,16 @@ shape and values, rather than proving the position arose through legal play.
 5. [src/random.cpp](src/random.cpp) samples the legal action list. Its generator
    preserves the original seed sequences and deterministic wood-grain pattern.
 6. [src/runner.cpp](src/runner.cpp) alternates agents, records games, and replays.
-7. [src/window.cpp](src/window.cpp) draws the original board and handles controls.
+7. Read [include/betago/mcts.hpp](include/betago/mcts.hpp), then follow
+   `MctsSearch::simulate` in [src/mcts.cpp](src/mcts.cpp). Predict a small tree's
+   values before tracing `select_child`, `terminal_value`, and `backpropagate`.
+8. [tests/test_mcts.cpp](tests/test_mcts.cpp) supplies known-outcome trees and
+   rollout examples to check those predictions.
+9. [src/window.cpp](src/window.cpp) draws the original board and handles controls.
    [src/tk.cpp](src/tk.cpp) loads Tk through its C API.
-8. [tests/test_main.cpp](tests/test_main.cpp) provides hand-checked diagrams,
-   integration tests, and migration checks.
+10. [tests/test_main.cpp](tests/test_main.cpp) provides hand-checked diagrams,
+    integration tests, and migration checks.
 
 The C++ port deliberately keeps flood fills, explicit state copies, and a single
-legality definition. Future optimization should follow measurements. Search,
-neural networks, and training are not implemented yet.
+legality definition. Future optimization should follow measurements. Neural
+networks and training are not implemented yet.

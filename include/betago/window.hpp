@@ -1,5 +1,6 @@
 #pragma once
 #include "random.hpp"
+#include "mcts.hpp"
 #include "tk.hpp"
 #include <iosfwd>
 #include <utility>
@@ -7,8 +8,9 @@
 namespace betago {
 class GoWindow {
 public:
-    GoWindow(std::int64_t seed = 0, int max_moves = 500, int delay_ms = 500);
+    GoWindow(std::int64_t seed = 0, int max_moves = 500, int delay_ms = 500, MctsSettings settings = {});
     void start_random();
+    void start_mcts(bool watch = false);
     void run() { tk_.loop(); }
     void self_test();
     void dump_canvas(const std::filesystem::path& path);
@@ -19,12 +21,16 @@ private:
     GameState state_ = GameState::new_game();
     std::vector<std::pair<GameState, Move>> history_;
     Move last_move_;
-    std::string demo_job_, random_job_;
+    std::string demo_job_, random_job_, mcts_job_;
     std::size_t demo_index_ = 0;
     bool random_truncated_ = false;
     std::int64_t seed_;
     int max_moves_, delay_ms_;
     RandomAgent black_, white_;
+    MctsSettings mcts_settings_;
+    std::unique_ptr<MctsAgent> mcts_agent_;
+    std::unique_ptr<MctsSearch> search_;
+    bool mcts_mode_ = false, mcts_watch_ = false;
     static int callback(void* data, Tcl_Interp*, int count, Tcl_Obj* const objects[]);
     void action(const std::vector<std::string>& args);
     void draw_board();
@@ -40,6 +46,11 @@ private:
     void demo_step();
     void toggle_random();
     void random_step();
+    bool computer_turn() const;
+    void stop_mcts();
+    void toggle_mcts(bool watch);
+    void schedule_mcts();
+    void mcts_step();
     void close();
     void notice(const std::string& message);
     void mode(const std::string& message);
