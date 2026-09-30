@@ -1,6 +1,8 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
 PROJECT_CONTEXT.txt
 results/
+.tools/
+build/
+out/
+*.o
+*.obj
+*.exe
