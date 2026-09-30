@@ -22,19 +22,66 @@ try {
     New-Item -ItemType Directory -Force -Path 'build', '.tools/cache/local', '.tools/cache/global' | Out-Null
     $env:ZIG_LOCAL_CACHE_DIR = Join-Path $taskTools 'cache/local'
     $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $taskTools 'cache/global'
-    $taskFlags = @('-std=c++20', '-Wall', '-Wextra', '-Wpedantic', '-Iinclude', '-Ithird_party', '-Ithird_party/tcl')
+    $taskFlags = @('-std=c++20', '-Wall', '-Wextra', '-Wpedantic', '-Iinclude', '-Ithird_party', '-Ithird_party/tcl', '-Ibuild/generated')
     if ($DebugBuild) { $taskFlags += @('-O0', '-g') } else { $taskFlags += '-O3' }
     $taskFlagSignature = $taskFlags -join ' '
     $taskStamp = 'build/compiler-flags.txt'
     $taskFlagsChanged = -not (Test-Path $taskStamp) -or ((Get-Content $taskStamp -Raw).Trim() -ne $taskFlagSignature)
+    # Identify the compiled source snapshot, including code not committed yet.
+    $taskGitAvailable = 'false'; $taskGitDirty = 'false'; $taskRevision = ''
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $taskGitRevision = & git rev-parse HEAD 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $taskRevision = ($taskGitRevision -join '').Trim(); $taskGitAvailable = 'true'
+            $taskGitStatus = & git status --porcelain --untracked-files=normal 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                if ($taskGitStatus) { $taskGitDirty = 'true' }
+            } else { $taskGitAvailable = 'false' }
+        }
+    }
+    $taskSourcePaths = @('build.ps1', 'CMakeLists.txt', 'cmake/build_info.hpp.in')
+    $taskSourcePaths += Get-ChildItem 'include', 'src', 'tests' -Recurse -File |
+        Where-Object { $_.Extension -in @('.cpp', '.hpp') } |
+        ForEach-Object { $_.FullName.Substring($PSScriptRoot.Length + 1).Replace('\', '/') }
+    [Array]::Sort($taskSourcePaths, [StringComparer]::Ordinal)
+    $taskFingerprintLines = foreach ($taskSourcePath in $taskSourcePaths) {
+        $taskFileHash = (Get-FileHash -LiteralPath $taskSourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        "${taskSourcePath}:$taskFileHash"
+    }
+    $taskHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $taskFingerprintBytes = [Text.Encoding]::UTF8.GetBytes(($taskFingerprintLines -join "`n") + "`n")
+        $taskSourceDigest = [BitConverter]::ToString($taskHasher.ComputeHash($taskFingerprintBytes)).Replace('-', '').ToLowerInvariant()
+    } finally { $taskHasher.Dispose() }
+    $taskBuildSignature = "$taskRevision|$taskGitAvailable|$taskGitDirty|$taskFlagSignature|$taskSourceDigest"
+    $taskInfoHeader = 'build/generated/build_info.hpp'; $taskInfoStamp = 'build/build-info-signature.txt'
+    if (-not (Test-Path $taskInfoHeader) -or -not (Test-Path $taskInfoStamp) -or
+        (Get-Content $taskInfoStamp -Raw).Trim() -ne $taskBuildSignature) {
+        $taskInfoText = Get-Content -LiteralPath 'cmake/build_info.hpp.in' -Raw
+        $taskInfoValues = @{
+            BETAGO_GIT_AVAILABLE = $taskGitAvailable; BETAGO_GIT_DIRTY = $taskGitDirty
+            BETAGO_GIT_REVISION = $taskRevision; BETAGO_SOURCE_SHA256 = $taskSourceDigest
+            BETAGO_BUILD_TIME = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            BETAGO_COMPILER = "Zig $(& $taskCompiler version) / Clang C++"
+            BETAGO_BUILD_FLAGS = $taskFlagSignature
+            BETAGO_BUILD_PROFILE = $(if ($DebugBuild) { 'Debug' } else { 'Release' })
+        }
+        foreach ($taskInfoKey in $taskInfoValues.Keys) {
+            $taskInfoText = $taskInfoText.Replace("@$taskInfoKey@", [string]$taskInfoValues[$taskInfoKey])
+        }
+        New-Item -ItemType Directory -Force -Path 'build/generated' | Out-Null
+        Set-Content -LiteralPath $taskInfoHeader -Value $taskInfoText -Encoding UTF8
+        Set-Content -LiteralPath $taskInfoStamp -Value $taskBuildSignature
+    }
     $taskHeaderTime = (Get-ChildItem 'include', 'third_party' -Recurse -File | Where-Object { $_.Extension -in @('.h', '.hpp') } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
     $taskObjects = @{}
-    foreach ($taskName in @('state', 'random', 'mcts', 'runner', 'tk', 'window', 'runner_main', 'play_main', 'test_main', 'test_mcts')) {
-        $taskSource = if ($taskName -in @('test_main', 'test_mcts')) { "tests/$taskName.cpp" } else { "src/$taskName.cpp" }
+    foreach ($taskName in @('state', 'random', 'mcts', 'runner', 'arena', 'tk', 'window', 'runner_main', 'play_main', 'test_main', 'test_mcts', 'test_arena')) {
+        $taskSource = if ($taskName -in @('test_main', 'test_mcts', 'test_arena')) { "tests/$taskName.cpp" } else { "src/$taskName.cpp" }
         $taskObject = "build/$taskName.o"
         if (-not $taskFlagsChanged -and (Test-Path $taskObject)) {
             $taskObjectTime = (Get-Item $taskObject).LastWriteTimeUtc
-            if ($taskObjectTime -gt (Get-Item $taskSource).LastWriteTimeUtc -and $taskObjectTime -gt $taskHeaderTime) {
+            $taskInfoCurrent = $taskName -ne 'runner_main' -or $taskObjectTime -gt (Get-Item $taskInfoHeader).LastWriteTimeUtc
+            if ($taskObjectTime -gt (Get-Item $taskSource).LastWriteTimeUtc -and $taskObjectTime -gt $taskHeaderTime -and $taskInfoCurrent) {
                 $taskObjects[$taskName] = $taskObject
                 continue
             }
@@ -48,9 +95,9 @@ try {
     $taskCore = @($taskObjects.state, $taskObjects.random, $taskObjects.mcts, $taskObjects.runner)
     foreach ($taskTarget in @('runner', 'play', 'tests')) {
         $taskTargetObjects = switch ($taskTarget) {
-            'runner' { $taskCore + @($taskObjects.runner_main) }
+            'runner' { $taskCore + @($taskObjects.arena, $taskObjects.runner_main) }
             'play' { $taskCore + @($taskObjects.tk, $taskObjects.window, $taskObjects.play_main) }
-            'tests' { $taskCore + @($taskObjects.test_main, $taskObjects.test_mcts) }
+            'tests' { $taskCore + @($taskObjects.arena, $taskObjects.test_main, $taskObjects.test_mcts, $taskObjects.test_arena) }
         }
         Write-Host "Linking build/$taskTarget.exe"
         & $taskCompiler c++ @taskTargetObjects -o "build/$taskTarget.exe"

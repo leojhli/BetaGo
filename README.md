@@ -5,7 +5,7 @@ checks, area scoring, seeded random agents, and classical Monte Carlo tree
 search (MCTS). The long-term goal is a small self-learning Go engine inspired by
 [KataGo](https://github.com/lightvector/KataGo).
 Currently it provides the rules environment, random and MCTS play, game
-recording, and search statistics.
+recording, search statistics, and an arena for repeatable agent comparisons.
 
 ## Build
 
@@ -126,6 +126,101 @@ Replay checks legality and recorded outcomes using the rules engine. The output
 file is overwritten when running a batch; use different paths to keep
 experiments. Generated `results/` files are ignored by Git.
 
+## Compare agents in the arena
+
+The arena measures the existing agents. It plays each comparison twice with
+colors exchanged, records both games, and reports outcomes and timing.
+
+Start with a small board and modest search budget:
+
+```powershell
+.\build\runner.exe --arena --pairs 10 --size 3 --komi 0.5 --a-simulations 32 --seed 10 --max-moves 100 --output results/arena_mcts_random.json
+.\build\runner.exe --replay results/arena_mcts_random.json
+```
+
+Agent A defaults to `mcts` and B to `random`. Select either with
+`--agent-a random|mcts` and `--agent-b random|mcts`. Compare two search budgets
+with:
+
+```powershell
+.\build\runner.exe --arena --agent-a mcts --agent-b mcts --pairs 10 --size 3 --komi 0.5 --a-simulations 32 --b-simulations 64 --seed 10 --max-moves 100 --output results/arena_32_vs_64.json
+```
+
+For a short 9x9 check of recording and timing, use:
+
+```powershell
+.\build\runner.exe --arena --pairs 1 --size 9 --simulations 8 --rollout-limit 20 --max-moves 4 --seed 10 --output results/arena_9x9_smoke.json
+```
+
+That four-move check is too short to measure playing strength. Larger boards
+and budgets require substantially more time. The arena defaults are five
+pairs, size 3, komi 7.5, move limit 100, seed 0, and output `results/arena.json`.
+One pair means two games; use `--pairs`, rather than `--games`, in arena mode.
+The `--black` and `--white` options belong to ordinary batches. Arena, replay,
+and benchmark modes are mutually exclusive.
+The 3x3 examples use komi 0.5 because 7.5 can dominate scoring on such a small
+board and mask differences between agents. Changing komi changes the task;
+keep it identical within a comparison. Exchanging colors balances assignments
+but does not remove the effect of komi. The default remains 7.5, matching the
+9x9 visual board.
+
+Common `--simulations`, `--rollout-limit`, and `--exploration` settings provide
+fallbacks for both agents. Override them independently with `--a-simulations`,
+`--a-rollout-limit`, `--a-exploration`, and the corresponding `--b-` options.
+Their defaults remain 128 simulations, 200 rollout actions, and exploration
+`sqrt(2)`. These are fixed simulation budgets per move; equal simulation counts
+do not guarantee equal thinking time. Compare wall times on a quiet machine
+using the same build and rules. Equal-time search budgets are not implemented.
+
+For pair index `i`, starting at zero, A receives `seed + 2*i` and B receives the
+next integer. The first game has A as Black, and the second has B as Black.
+Each game constructs fresh agents using the same identity seeds, so changing
+colors does not inherit the preceding game's random-generator state. Repeating
+the settings reproduces moves and outcomes; times and recording timestamps
+vary.
+
+The summary reports wins, losses, draws, and truncated games for each identity
+and color, plus mean game length and mean move time. Only games completed by
+two passes have an outcome. Win rate is `wins / completed_games`; draws remain
+in the denominator. Score rate is `(wins + 0.5*draws) / completed_games`.
+An unfinished game contributes neither a loss nor a draw, and rates with no
+completed games are `null` (`n/a` in the terminal). Mean game length includes
+truncated games; a separate completed-game mean excludes them.
+
+Search throughput divides total simulations by total active search seconds,
+rather than averaging per-move rates. Mean move time includes the full agent
+decision. The summary also separates completed and truncated rollouts and
+reports their truncation rate. Rollout cutoffs remain search approximations;
+they are distinct from games stopped at the arena's move limit.
+
+The 95% win-rate and score-rate bounds treat a complete color pair as one
+observation. For each pair, average its two win indicators, or its two scores
+with draws worth 0.5. Across `n` complete pairs, the Hoeffding bound has half
+width `sqrt(log(40)/(2*n))`, clipped to `[0,1]`. This assumes independent seed
+pairs and is conservative with small samples. Both games must complete for a
+pair to enter these bounds. Individually completed games in an incomplete pair
+still enter ordinary outcome rates. Bounds are `null` when no pairs complete.
+Because move-limit exclusions can select which pairs survive, the bounds
+describe the population where both color games complete; they do not resolve
+the missing outcomes. The saved bound records its sample size, method,
+population, and independence assumption.
+
+Arena files use the existing schema version 1 and add `mode: "arena"`, A/B
+configurations, match settings, metadata, and a summary. Each game retains the
+replayable moves, score, and termination fields, adding pair identity, color
+assignment, identity seeds, and every decision's player, agent, full runtime,
+and optional search statistics. Replay validates game legality and recorded
+outcomes using the same rules engine.
+
+Metadata records the Git revision and dirty state at build time, a SHA-256
+fingerprint of the authored code, build timestamp, compiler, flags, profile,
+and C++ standard. It also records the run timestamp, host name, OS family,
+architecture, available CPU identifier, and hardware-thread count. Unavailable
+machine and Git values are `null`. Keep this metadata with comparison results
+so later changes to code or machines are visible. The arena performs evaluation;
+neural networks, self-play training, and reinforcement learning are not yet
+implemented.
+
 ## How search chooses a move
 
 MCTS builds a fresh tree for each decision. A node holds a position separately
@@ -190,6 +285,10 @@ Search tests cover hand-scored UCT choices, alternating backup signs, terminal
 rewards, exact simulation counts, rollout cutoffs, legal outputs, unchanged input
 states, deterministic seeds, and equivalent incremental searches. The GUI
 checks exercise real Tk events and controls in a hidden window.
+Arena tests verify exchanged colors, identity seeds, fresh generators, exact
+W/L/D accounting, draws and truncations, per-color results, paired uncertainty,
+weighted timing, deterministic games, replay compatibility, and invalid
+settings using small controlled games.
 
 ## Rules contract
 
@@ -232,6 +331,12 @@ shape and values, rather than proving the position arose through legal play.
    [src/tk.cpp](src/tk.cpp) loads Tk through its C API.
 10. [tests/test_main.cpp](tests/test_main.cpp) provides hand-checked diagrams,
     integration tests, and migration checks.
+11. Read the arena types in [include/betago/arena.hpp](include/betago/arena.hpp),
+    then trace `run_arena` in [src/arena.cpp](src/arena.cpp): construct agents,
+    exchange colors, record decisions, and summarize completed outcomes.
+12. Predict the totals for a pair of pass-only games before reading
+    [tests/test_arena.cpp](tests/test_arena.cpp). Trace `summarize_arena` to see
+    why two games contribute one independent sample to the uncertainty bounds.
 
 The C++ port deliberately keeps flood fills, explicit state copies, and a single
 legality definition. Future optimization should follow measurements. Neural

@@ -1,0 +1,15 @@
+#pragma once
+
+namespace betago::build_info {
+inline constexpr bool git_available = @BETAGO_GIT_AVAILABLE@;
+inline constexpr bool dirty = @BETAGO_GIT_DIRTY@;
+inline constexpr const char* revision = "@BETAGO_GIT_REVISION@";
+inline constexpr const char* source_sha256 = "@BETAGO_SOURCE_SHA256@";
+inline constexpr const char* built_at_utc = "@BETAGO_BUILD_TIME@";
+inline constexpr const char* compiler = R"betago(@BETAGO_COMPILER@)betago";
+inline constexpr const char* flags = R"betago(@BETAGO_BUILD_FLAGS@)betago";
+}
+
+#ifndef BETAGO_BUILD_PROFILE
+#define BETAGO_BUILD_PROFILE "@BETAGO_BUILD_PROFILE@"
+#endif
