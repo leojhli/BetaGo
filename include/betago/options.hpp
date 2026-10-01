@@ -16,7 +16,8 @@ public:
             if (values_.contains(key)) throw std::invalid_argument("Repeated option " + key);
             if (flags.contains(key)) values_[key] = "";
             else if (valued.contains(key)) {
-                if (++i == argc) throw std::invalid_argument("Missing value for " + key);
+                if (++i == argc || valued.contains(argv[i]) || flags.contains(argv[i]))
+                    throw std::invalid_argument("Missing value for " + key);
                 values_[key] = argv[i];
             } else throw std::invalid_argument("Unknown option " + key);
         }
@@ -39,7 +40,10 @@ public:
         if (!has(key)) return fallback;
         auto value = text(key);
         std::size_t used = 0;
-        double number = std::stod(value, &used);
+        double number;
+        try { number = std::stod(value, &used); }
+        catch (const std::invalid_argument&) { throw std::invalid_argument("Invalid number for " + key); }
+        catch (const std::out_of_range&) { throw std::invalid_argument("Invalid number for " + key); }
         if (used != value.size() || !std::isfinite(number)) throw std::invalid_argument("Invalid number for " + key);
         return number;
     }

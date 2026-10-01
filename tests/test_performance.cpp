@@ -399,6 +399,34 @@ int run_performance_tests() {
         check(restored.parameters() == original.parameters() && restored.velocity() == original.velocity() &&
               restored.training_steps() == original.training_steps() && restored.last_optimizer() == original.last_optimizer());
     });
+    suite.test("neural choices and expansions each scan legal moves only once", [] {
+        // A synthetic evaluator keeps feature encoding out of the work counts.
+        const auto evaluator = [](const GameState& state) {
+            return Prediction{{}, std::vector<double>(state.size() * state.size() + 1, 1.0), 0.25};
+        };
+        for (const auto& state : {GameState::new_game(3, .5).play(Point{1, 1}),
+                                  GameState::new_game(1, .5)}) {
+            const auto legal = state.legal_moves();
+            {
+                ProfileSession session;
+                PolicyAgent policy(evaluator);
+                check(policy.choose_move(state) == legal.front(), "Uniform policy changed legal tie order");
+                check(metric(session, ProfileWork::LegalMoves).calls == 1,
+                      "Policy choice repeated its legality sweep");
+            }
+            {
+                ProfileSession session;
+                NeuralMctsSearch search(state, {12, 1.5}, evaluator);
+                search.step(12);
+                const auto stats = search.statistics();
+                check(stats.network_evaluations > 1 && stats.simulations == 12);
+                check(metric(session, ProfileWork::LegalMoves).calls ==
+                      static_cast<std::uint64_t>(stats.network_evaluations),
+                      "Neural expansion repeated its legality sweep");
+                check(std::find(legal.begin(), legal.end(), search.best_move()) != legal.end());
+            }
+        }
+    });
     suite.test("profiling preserves exact classical and neural search statistics", [] {
         const auto state = GameState::new_game(3, .5).play(Point{1, 1});
         auto network = std::make_shared<PolicyValueNetwork>(NetworkSettings{3, 2, 3}, 91);

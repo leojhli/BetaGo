@@ -23,7 +23,8 @@ On this Windows machine, run from the repository root:
 The script builds optimized `build/play.exe`, `build/runner.exe`,
 `build/network.exe`, `build/selfplay.exe`, `build/profile.exe`, and `build/tests.exe`. On its first run it downloads a pinned portable C++ compiler
 into `.tools/` and verifies the archive's checksum. Nothing is installed globally.
-Later builds reuse the compiler and unchanged object files. Use `-DebugBuild`
+Later builds reuse the compiler and unchanged object files, and skip linking
+executables whose inputs have not changed. Use `-DebugBuild`
 for an unoptimized build with debug information.
 The build also produces `build/fake_gtp.exe` for protocol and process tests;
 automated tests do not need KataGo or downloaded models.

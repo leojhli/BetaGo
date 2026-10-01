@@ -26,6 +26,41 @@ void validate_value(double value) {
         throw std::invalid_argument("Neural value must be finite and between -1 and 1");
 }
 
+// Reuse the caller's legal moves for normalization and selection/expansion.
+std::vector<double> normalize_legal_priors(const GameState& state, const Prediction& prediction,
+                                         const std::vector<Move>& legal) {
+    ProfileScope scope(ProfileWork::Normalize);
+    const auto action_count = static_cast<std::size_t>(state.size() * state.size() + 1);
+    if (prediction.policy.size() != action_count)
+        throw std::invalid_argument("Neural policy action count does not match the board");
+    validate_value(prediction.value);
+    for (double weight : prediction.policy)
+        if (!std::isfinite(weight) || weight < 0)
+            throw std::invalid_argument("Neural policy weights must be finite and nonnegative");
+
+    std::vector<double> priors(action_count, 0.0);
+    if (legal.empty()) return priors;
+    double largest = 0;
+    for (Move move : legal)
+        largest = std::max(largest, prediction.policy[action_index(move, state.size())]);
+    if (largest == 0) {
+        const double uniform = 1.0 / static_cast<double>(legal.size());
+        for (Move move : legal) priors[action_index(move, state.size())] = uniform;
+        return priors;
+    }
+
+    // Scaling by the largest legal weight avoids overflowing the sum even
+    // when an evaluator supplies unnormalized weights near DBL_MAX.
+    double mass = 0;
+    for (Move move : legal) {
+        const auto action = action_index(move, state.size());
+        priors[action] = prediction.policy[action] / largest;
+        mass += priors[action];
+    }
+    for (double& prior : priors) prior /= mass;
+    return priors;
+}
+
 void validate_node_values(const neural_mcts_detail::Node& node) {
     if (node.visits < 0 || !std::isfinite(node.value_sum)
         || std::abs(node.value_sum) > static_cast<double>(node.visits) + 1e-9
@@ -51,37 +86,7 @@ Node::Node(GameState position, Move move, Node* parent_node, double move_prior)
 }
 
 std::vector<double> normalize_priors(const GameState& state, const Prediction& prediction) {
-    ProfileScope scope(ProfileWork::Normalize);
-    const auto action_count = static_cast<std::size_t>(state.size() * state.size() + 1);
-    if (prediction.policy.size() != action_count)
-        throw std::invalid_argument("Neural policy action count does not match the board");
-    validate_value(prediction.value);
-    for (double weight : prediction.policy)
-        if (!std::isfinite(weight) || weight < 0)
-            throw std::invalid_argument("Neural policy weights must be finite and nonnegative");
-
-    std::vector<double> priors(action_count, 0.0);
-    const auto legal = state.legal_moves();
-    if (legal.empty()) return priors;
-    double largest = 0;
-    for (Move move : legal)
-        largest = std::max(largest, prediction.policy[action_index(move, state.size())]);
-    if (largest == 0) {
-        const double uniform = 1.0 / static_cast<double>(legal.size());
-        for (Move move : legal) priors[action_index(move, state.size())] = uniform;
-        return priors;
-    }
-
-    // Scaling by the largest legal weight avoids overflowing the sum even
-    // when an evaluator supplies unnormalized weights near DBL_MAX.
-    double mass = 0;
-    for (Move move : legal) {
-        const auto action = action_index(move, state.size());
-        priors[action] = prediction.policy[action] / largest;
-        mass += priors[action];
-    }
-    for (double& prior : priors) prior /= mass;
-    return priors;
+    return normalize_legal_priors(state, prediction, state.legal_moves());
 }
 
 Node& select_child(Node& parent, double c_puct) {
@@ -137,8 +142,8 @@ Move PolicyAgent::choose_move(const GameState& state) {
     if (state.is_terminal())
         throw std::invalid_argument("Cannot choose a policy move after the game ends");
     Prediction prediction = evaluator_(state);
-    prediction.policy = neural_mcts_detail::normalize_priors(state, prediction);
     const auto legal = state.legal_moves();
+    prediction.policy = normalize_legal_priors(state, prediction, legal);
     Move best = legal.front();
     for (Move move : legal)
         if (prediction.policy[action_index(move, state.size())]
@@ -170,9 +175,11 @@ double NeuralMctsSearch::evaluate_and_expand(neural_mcts_detail::Node& node) {
     }
 
     const Prediction prediction = evaluator_(node.state);
-    const auto priors = neural_mcts_detail::normalize_priors(node.state, prediction);
+    const auto legal = node.state.legal_moves();
+    const auto priors = normalize_legal_priors(node.state, prediction, legal);
     std::vector<std::unique_ptr<neural_mcts_detail::Node>> children;
-    for (Move move : node.state.legal_moves()) {
+    children.reserve(legal.size());
+    for (Move move : legal) {
         children.push_back(std::make_unique<neural_mcts_detail::Node>(
             node.state.play(move), move, &node, priors[action_index(move, node.state.size())]));
     }

@@ -108,8 +108,21 @@ try {
             'fake_gtp' { @($taskObjects.state, $taskObjects.fake_gtp) }
             'tests' { $taskCore + $taskSelfPlay + $taskGtp + @($taskObjects.arena, $taskObjects.test_main, $taskObjects.test_mcts, $taskObjects.test_arena, $taskObjects.test_neural, $taskObjects.test_neural_mcts, $taskObjects.test_neural_arena, $taskObjects.test_selfplay, $taskObjects.test_performance, $taskObjects.test_gtp, $taskObjects.test_training_live, $taskObjects.sgf, $taskObjects.teacher, $taskObjects.pretraining, $taskObjects.test_sgf, $taskObjects.test_teacher, $taskObjects.test_pretraining) }
         }
-        Write-Host "Linking build/$taskTarget.exe"
-        & $taskCompiler c++ @taskTargetObjects -o "build/$taskTarget.exe"
+        $taskExecutable = "build/$taskTarget.exe"
+        if (-not $taskFlagsChanged -and (Test-Path -LiteralPath $taskExecutable)) {
+            $taskExecutableTime = (Get-Item -LiteralPath $taskExecutable).LastWriteTimeUtc
+            # The script is also an input: changing the link recipe must relink.
+            $taskLinkNeeded = $false
+            foreach ($taskLinkInput in (@('build.ps1') + $taskTargetObjects)) {
+                if ((Get-Item -LiteralPath $taskLinkInput).LastWriteTimeUtc -ge $taskExecutableTime) {
+                    $taskLinkNeeded = $true
+                    break
+                }
+            }
+            if (-not $taskLinkNeeded) { continue }
+        }
+        Write-Host "Linking $taskExecutable"
+        & $taskCompiler c++ @taskTargetObjects -o $taskExecutable
         if ($LASTEXITCODE -ne 0) { throw "Linking failed: $taskTarget" }
     }
     $taskRuntime = Join-Path $PSScriptRoot 'build/runtime'

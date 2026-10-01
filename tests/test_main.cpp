@@ -266,6 +266,44 @@ int main(int argc, char** argv) {
         Options options(3, values, {"--count"}, {});
         rejects([&] { options.integer("--count", 1); });
     });
+    suite.test("CLI missing values identify the option", [] {
+        char executable[] = "tests", key[] = "--output";
+        for (std::string next : {"", "--help", "--count", "--output"}) {
+            char* values[] = {executable, key, next.data()};
+            bool rejected = false;
+            try { Options options(next.empty() ? 2 : 3, values, {"--output", "--count"}, {"--help"}); }
+            catch (const std::invalid_argument& error) {
+                check(std::string(error.what()) == "Missing value for --output");
+                rejected = true;
+            }
+            check(rejected, "An option must not consume the next option as its value");
+        }
+    });
+    suite.test("CLI values preserve signed numbers and paths", [] {
+        char executable[] = "tests", seed[] = "--seed", seed_value[] = "-12";
+        char komi[] = "--komi", komi_value[] = "-7.5", output[] = "--output";
+        for (std::string path : {"results/my games.json", "./--help", "--position.json"}) {
+            char* values[] = {executable, seed, seed_value, komi, komi_value, output, path.data()};
+            Options options(7, values, {"--seed", "--komi", "--output"}, {"--help"});
+            check(options.integer("--seed", 0) == -12);
+            check(options.real("--komi", 0) == -7.5);
+            check(options.text("--output") == path);
+        }
+    });
+    suite.test("CLI invalid real numbers identify the option", [] {
+        char executable[] = "tests", key[] = "--komi";
+        for (std::string value : {"bad", "", "1e9999", "1.5oops", "nan", "inf"}) {
+            char* values[] = {executable, key, value.data()};
+            Options options(3, values, {"--komi"}, {});
+            bool rejected = false;
+            try { options.real("--komi", 0); }
+            catch (const std::invalid_argument& error) {
+                check(std::string(error.what()) == "Invalid number for --komi");
+                rejected = true;
+            }
+            check(rejected, "Expected invalid real number to be rejected");
+        }
+    });
     if (!oracle_path.empty()) suite.test("reference position fixtures", [&] {
         std::ifstream stream(oracle_path);
         check(bool(stream), "Cannot open oracle fixture");
