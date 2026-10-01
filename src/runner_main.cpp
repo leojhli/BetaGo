@@ -33,9 +33,19 @@ bool same_file_path(const std::filesystem::path& first, const std::filesystem::p
 
 void protect_checkpoints(const std::string& output,
                          std::initializer_list<betago::AgentConfiguration> configurations) {
-    for (const auto& configuration : configurations)
+    for (const auto& configuration : configurations) {
         if (!configuration.checkpoint.empty() && same_file_path(output, configuration.checkpoint))
             throw std::invalid_argument("--output must not overwrite an input checkpoint");
+        if (configuration.external_gtp) {
+            const auto& external = *configuration.external_gtp;
+            for (const auto& input : {external.profile_path, external.executable})
+                if (!input.empty() && same_file_path(output, input))
+                    throw std::invalid_argument("--output must not overwrite an external profile or executable");
+            for (const auto& file : external.files)
+                if (same_file_path(output, file.path))
+                    throw std::invalid_argument("--output must not overwrite a declared external configuration/model");
+        }
+    }
 }
 
 betago::AgentConfiguration agent_configuration(const betago::Options& args, const std::string& kind,
@@ -44,10 +54,20 @@ betago::AgentConfiguration agent_configuration(const betago::Options& args, cons
                                                const std::string& puct_option = "",
                                                const std::string& simulations_option = "",
                                                const std::string& exploration_option = "",
-                                               const std::string& rollout_option = "") {
+                                               const std::string& rollout_option = "",
+                                               const std::string& gtp_profile_option = "") {
     using namespace betago;
     AgentConfiguration result;
     result.kind = kind;
+    if (kind == "external-gtp") {
+        if (gtp_profile_option.empty() || !args.has(gtp_profile_option))
+            throw std::invalid_argument("external-gtp requires an arena --a-gtp-profile or --b-gtp-profile");
+        for (const auto& option : {simulations_option, exploration_option, rollout_option})
+            if (!option.empty() && args.has(option))
+                throw std::invalid_argument(option + " requires a BetaGo search agent");
+        result.external_gtp = load_external_gtp_profile(args.text(gtp_profile_option));
+    } else if (!gtp_profile_option.empty() && args.has(gtp_profile_option))
+        throw std::invalid_argument(gtp_profile_option + " requires an external-gtp agent");
     if (uses_checkpoint(kind)) {
         for (const auto& option : {exploration_option, rollout_option})
             if (!option.empty() && args.has(option))
@@ -72,16 +92,17 @@ betago::AgentConfiguration agent_configuration(const betago::Options& args, cons
 
 void validate_common_search_options(const betago::Options& args,
                                    std::initializer_list<betago::AgentConfiguration> agents) {
-    bool has_classical = false, has_neural = false, has_search = false;
+    bool has_classical = false, has_neural = false, has_search = false, has_external = false;
     for (const auto& agent : agents) {
         has_classical = has_classical || agent.kind == "mcts";
         has_neural = has_neural || uses_checkpoint(agent.kind);
         has_search = has_search || agent.kind == "mcts" || agent.kind == "neural-mcts";
+        has_external = has_external || agent.kind == "external-gtp";
     }
-    if (has_neural && !has_classical)
+    if ((has_neural || has_external) && !has_classical)
         for (const auto* option : {"--exploration", "--rollout-limit"})
             if (args.has(option)) throw std::invalid_argument(std::string(option) + " requires a classical mcts agent");
-    if (has_neural && !has_search && args.has("--simulations"))
+    if ((has_neural || has_external) && !has_search && args.has("--simulations"))
         throw std::invalid_argument("--simulations requires an mcts or neural-mcts agent");
 }
 
@@ -156,6 +177,11 @@ std::string number_or_na(const betago::Json& value, int precision = 3) {
 void print_arena_summary(const betago::Json& summary) {
     std::cout << "Completed: " << summary.at("completed_games") << "; truncated: " << summary.at("truncated_games")
               << "; complete color pairs: " << summary.at("complete_pairs") << '\n';
+    if (summary.contains("attempted_games"))
+        std::cout << "Attempted: " << summary.at("attempted_games") << "; engine failures: " << summary.at("failed_games")
+                  << "; unscored resignations: " << summary.at("resigned_games")
+                  << "; incomplete color pairs: " << summary.at("incomplete_pairs")
+                  << "; cleanup warnings: " << summary.value("cleanup_warning_count", 0) << '\n';
     std::cout << "Mean game length: " << number_or_na(summary.at("mean_game_length"), 1) << " moves\n";
     for (const auto* identity : {"a", "b"}) {
         const auto& agent = summary.at("agents").at(identity);
@@ -170,22 +196,24 @@ void print_arena_summary(const betago::Json& summary) {
                       << '/' << record.at("draws") << " W/L/D, " << record.at("truncated_games") << " truncated\n";
         }
         std::cout << "  Mean move: " << number_or_na(agent.at("mean_move_seconds")) << "s; "
-                  << agent.at("simulations") << " simulations; "
+                  << number_or_na(agent.at("simulations"), 0) << " simulations; "
                   << number_or_na(agent.at("simulations_per_second"), 1) << " simulations/s; "
-                  << agent.at("truncated_rollouts") << " rollout cutoffs\n";
-        if (agent.contains("network_evaluations"))
-            std::cout << "  Neural work: " << agent.at("network_evaluations") << " network evaluations; "
-                      << agent.at("terminal_evaluations") << " exact terminal evaluations\n";
+                  << number_or_na(agent.at("truncated_rollouts"), 0) << " rollout cutoffs\n";
+        if (agent.contains("network_evaluations") && !agent.at("network_evaluations").is_null())
+            std::cout << "  Neural work: " << number_or_na(agent.at("network_evaluations"), 0) << " network evaluations; "
+                      << number_or_na(agent.at("terminal_evaluations"), 0) << " exact terminal evaluations\n";
         for (const auto* measure : {"win", "score"}) {
             const auto& interval = agent.at(std::string("paired_") + measure + "_rate_95");
             std::cout << "  Paired " << measure << " rate: ";
-            if (interval.is_null()) std::cout << "n/a (no complete pairs)\n";
+            if (interval.is_null()) std::cout << "n/a (" << summary.value("uncertainty_exclusion_reason", "no complete pairs") << ")\n";
             else std::cout << number_or_na(interval.at("estimate")) << "; 95% bound ["
                            << number_or_na(interval.at("lower")) << ", " << number_or_na(interval.at("upper"))
                            << "] from " << interval.at("sample_size") << " pairs\n";
         }
     }
     std::cout << "Bounds use complete pairs only; move-limit exclusions can bias comparisons.\n";
+    if (summary.contains("attempted_games"))
+        std::cout << "Configuration-specific comparison; reference labels are unvalidated metadata. No kyu/dan estimate.\n";
 }
 }
 
@@ -197,10 +225,11 @@ int main(int argc, char** argv) {
             "--agent-a", "--agent-b", "--pairs", "--a-simulations", "--b-simulations",
             "--a-rollout-limit", "--b-rollout-limit", "--a-exploration", "--b-exploration",
             "--agent", "--checkpoint", "--black-checkpoint", "--white-checkpoint",
-            "--a-checkpoint", "--b-checkpoint", "--c-puct", "--a-c-puct", "--b-c-puct"};
+            "--a-checkpoint", "--b-checkpoint", "--c-puct", "--a-c-puct", "--b-c-puct",
+            "--a-gtp-profile", "--b-gtp-profile"};
         Options args(argc, argv, valued, {"--help", "--benchmark", "--arena"});
         if (args.has("--help")) {
-            std::cout << "BetaGo game runner (random, classical MCTS, policy, or neural MCTS)\n"
+            std::cout << "BetaGo game runner (random, classical MCTS, policy, neural MCTS, or external GTP arena)\n"
                       << "runner.exe [--size 9] [--komi 7.5] [--games 1] [--seed 0]\n"
                       << "           [--max-moves 500] [--output results/random_games.json]\n"
                       << "           [--black random|mcts|policy|neural-mcts] [--white random|mcts|policy|neural-mcts]\n"
@@ -214,6 +243,8 @@ int main(int argc, char** argv) {
                       << "           [--a-rollout-limit 200] [--b-rollout-limit 200]\n"
                       << "           [--a-exploration 1.4142135623730951] [--b-exploration 1.4142135623730951]\n"
                       << "           [--a-checkpoint path] [--b-checkpoint path] [--c-puct 1.5] [--a-c-puct 1.5] [--b-c-puct 1.5]\n"
+                      << "           [--agent-a external-gtp --a-gtp-profile profiles/engine.json]\n"
+                      << "           [--agent-b external-gtp --b-gtp-profile profiles/engine.json]\n"
                       << "Each pair plays both color assignments with fixed identity seeds.\n"
                       << "Common search/checkpoint settings are fallbacks for each agent. Neural agents require a matching checkpoint.\n"
                       << "Policy selects the highest legal prior; neural-mcts uses PUCT and network leaf values without rollouts.\n";
@@ -224,7 +255,8 @@ int main(int argc, char** argv) {
         if (!args.has("--arena")) {
             for (const auto* key : {"--agent-a", "--agent-b", "--pairs", "--a-simulations", "--b-simulations",
                                    "--a-rollout-limit", "--b-rollout-limit", "--a-exploration", "--b-exploration",
-                                   "--a-checkpoint", "--b-checkpoint", "--a-c-puct", "--b-c-puct"})
+                                   "--a-checkpoint", "--b-checkpoint", "--a-c-puct", "--b-c-puct",
+                                   "--a-gtp-profile", "--b-gtp-profile"})
                 if (args.has(key)) throw std::invalid_argument(std::string(key) + " requires --arena");
         } else {
             for (const auto* key : {"--games", "--black", "--white", "--black-checkpoint", "--white-checkpoint"})
@@ -256,9 +288,9 @@ int main(int argc, char** argv) {
         if (args.has("--arena")) {
             ArenaSettings arena;
             arena.a = agent_configuration(args, args.text("--agent-a", "mcts"), settings, "--a-checkpoint",
-                "--a-c-puct", "--a-simulations", "--a-exploration", "--a-rollout-limit");
+                "--a-c-puct", "--a-simulations", "--a-exploration", "--a-rollout-limit", "--a-gtp-profile");
             arena.b = agent_configuration(args, args.text("--agent-b", "random"), settings, "--b-checkpoint",
-                "--b-c-puct", "--b-simulations", "--b-exploration", "--b-rollout-limit");
+                "--b-c-puct", "--b-simulations", "--b-exploration", "--b-rollout-limit", "--b-gtp-profile");
             validate_common_neural_options(args, {{arena.a, "--a-checkpoint"}, {arena.b, "--b-checkpoint"}});
             validate_common_search_options(args, {arena.a, arena.b});
             arena.pairs = args.integer("--pairs", 5); arena.size = args.integer("--size", 3);
@@ -266,17 +298,20 @@ int main(int argc, char** argv) {
             arena.validate();
             auto output = args.text("--output", "results/arena.json");
             protect_checkpoints(output, {arena.a, arena.b});
+            const bool external = arena.a.kind == "external-gtp" || arena.b.kind == "external-gtp";
             std::cout << "A: " << arena.a.kind << "; B: " << arena.b.kind << "; " << arena.pairs
                       << " color pairs on " << arena.size << 'x' << arena.size << '\n' << std::flush;
             auto data = run_arena(arena, arena_metadata(), [](int index, const Json& record) {
                 std::cout << "Game " << index + 1 << " (pair " << record.at("pair_index").get<int>() + 1
                           << ", Black " << (record.at("black_agent") == "a" ? "A" : "B") << "): "
                           << describe(record) << '\n' << std::flush;
-            });
-            save_records(output, data);
+            }, {}, external ? ArenaSnapshot([&](const Json& snapshot) { save_records_atomic(output, snapshot); }) : ArenaSnapshot{});
+            if (external) save_records_atomic(output, data);
+            else save_records(output, data);
             print_arena_summary(data.at("summary"));
             std::cout << "Saved " << output << '\n';
-            return 0;
+            return external && (data.at("summary").at("failed_games").get<int>() ||
+                                data.at("summary").at("resigned_games").get<int>()) ? 2 : 0;
         }
         if (args.has("--benchmark")) {
             const auto kind = args.text("--agent", "mcts");

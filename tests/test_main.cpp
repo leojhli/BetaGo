@@ -14,6 +14,7 @@ int run_neural_mcts_tests();
 int run_neural_arena_tests();
 int run_selfplay_tests();
 int run_performance_tests();
+int run_gtp_tests(const std::filesystem::path& fake_exe);
 
 void check(bool condition, const std::string& message = "Unexpected result") {
     if (!condition) throw std::runtime_error(message);
@@ -43,6 +44,21 @@ struct Suite {
 };
 
 int main(int argc, char** argv) {
+    std::filesystem::path oracle_path;
+#if defined(_WIN32)
+    auto fake_exe = std::filesystem::absolute(argv[0]).parent_path() / "fake_gtp.exe";
+#else
+    auto fake_exe = std::filesystem::absolute(argv[0]).parent_path() / "fake_gtp";
+#endif
+    for (int index = 1; index < argc; ++index) {
+        const std::string key = argv[index];
+        if ((key != "--oracle" && key != "--fake-gtp") || index + 1 >= argc) {
+            std::cerr << "Expected --oracle path or --fake-gtp path\n";
+            return 2;
+        }
+        if (key == "--oracle") oracle_path = argv[++index];
+        else fake_exe = argv[++index];
+    }
     Suite suite;
     suite.test("new board and text", [] {
         auto state = GameState::new_game();
@@ -246,8 +262,8 @@ int main(int argc, char** argv) {
         Options options(3, values, {"--count"}, {});
         rejects([&] { options.integer("--count", 1); });
     });
-    if (argc == 3 && std::string(argv[1]) == "--oracle") suite.test("reference position fixtures", [&] {
-        std::ifstream stream(argv[2]);
+    if (!oracle_path.empty()) suite.test("reference position fixtures", [&] {
+        std::ifstream stream(oracle_path);
         check(bool(stream), "Cannot open oracle fixture");
         auto fixtures = Json::parse(stream);
         for (const auto& fixture : fixtures) {
@@ -266,8 +282,8 @@ int main(int argc, char** argv) {
         }
         std::cout << "Compared " << fixtures.size() << " reference positions.\n";
     });
-    if (argc == 3 && std::string(argv[1]) == "--oracle") suite.test("original seeded game compatibility", [&] {
-        auto path = std::filesystem::path(argv[2]).parent_path() / "seeded_games.json";
+    if (!oracle_path.empty()) suite.test("original seeded game compatibility", [&] {
+        auto path = oracle_path.parent_path() / "seeded_games.json";
         auto data = load_records(path);
         for (const auto& record : data["games"]) {
             RandomAgent black(record["black_seed"].get<std::int64_t>()), white(record["white_seed"].get<std::int64_t>());
@@ -287,5 +303,6 @@ int main(int argc, char** argv) {
     int neural_arena_failures = run_neural_arena_tests();
     int selfplay_failures = run_selfplay_tests();
     int performance_failures = run_performance_tests();
-    return suite.failed || search_failures || arena_failures || neural_failures || puct_failures || neural_arena_failures || selfplay_failures || performance_failures ? 1 : 0;
+    int gtp_failures = run_gtp_tests(fake_exe);
+    return suite.failed || search_failures || arena_failures || neural_failures || puct_failures || neural_arena_failures || selfplay_failures || performance_failures || gtp_failures ? 1 : 0;
 }

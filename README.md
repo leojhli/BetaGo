@@ -6,6 +6,11 @@ Currently it provides the rules environment, random and MCTS play, game
 recording, search statistics, an arena for repeatable agent comparisons, a
 small CPU policy/value network, neural MCTS guided by its policy and value,
 and a resumable self-play training loop with checkpoint evaluation and native performance profiling.
+Windows arena experiments can also compare these agents with external GTP engines.
+A local KataGo CPU profile is set up: run `.\match-katago.ps1` to compare the
+current checkpoint, or `.\setup-katago.ps1` to restore its local dependencies.
+See [external engine matches](docs/external_gtp.md) for the verified smoke
+results, custom profiles, and the limits of interpreting reference labels.
 
 ## Build
 
@@ -20,6 +25,8 @@ The script builds optimized `build/play.exe`, `build/runner.exe`,
 into `.tools/` and verifies the archive's checksum. Nothing is installed globally.
 Later builds reuse the compiler and unchanged object files. Use `-DebugBuild`
 for an unoptimized build with debug information.
+The build also produces `build/fake_gtp.exe` for protocol and process tests;
+automated tests do not need KataGo or downloaded models.
 
 Windows Smart App Control can block locally built unsigned executables even
 after compilation succeeds. A trusted signed build or an appropriate Windows
@@ -53,6 +60,8 @@ For a Windows CMake build, copy `build/runtime/` beside the generated `play.exe`
 before running the visual board or its tests. The rules, network, search,
 runner, and native tests are portable C++; the current GUI loader and helper build script
 target Windows.
+External GTP parsing is portable, while external process launching currently
+supports Windows. Other platforms keep the existing native functionality.
 
 ## Play on screen
 

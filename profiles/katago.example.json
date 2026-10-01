@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "kind": "external_gtp_profile",
+  "adapter": "katago",
+  "display_name": "KataGo supplied model / fixed search configuration",
+  "executable": "../external/katago/katago.exe",
+  "working_directory": "../external/katago",
+  "arguments": [
+    "gtp",
+    "-model", "../external/katago/normal.bin.gz",
+    "-config", "../external/katago/gtp.cfg"
+  ],
+  "files": [
+    { "role": "model", "path": "../external/katago/normal.bin.gz" },
+    { "role": "config", "path": "../external/katago/gtp.cfg" }
+  ],
+  "notes": "Replace paths with your supplied files. This profile does not assign a human rank.",
+  "seeded_stochastic": false,
+  "timeouts": {
+    "startup_ms": 120000,
+    "command_ms": 30000,
+    "shutdown_ms": 2000
+  }
+}

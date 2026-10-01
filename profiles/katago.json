@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "kind": "external_gtp_profile",
+  "adapter": "katago",
+  "display_name": "KataGo v1.18.1 / b6c96 / CPU / 32 visits, 2 seconds",
+  "executable": "../.tools/katago/v1.18.1-eigen/katago.exe",
+  "working_directory": "../.tools/katago/v1.18.1-eigen",
+  "arguments": [
+    "gtp",
+    "-model", "../.tools/katago/kata1-b6c96-s175395328-d26788732.txt.gz",
+    "-config", "katago-cpu.cfg",
+    "-override-config", "searchRandSeed={seed},nnRandSeed={seed}"
+  ],
+  "files": [
+    { "role": "model", "path": "../.tools/katago/kata1-b6c96-s175395328-d26788732.txt.gz" },
+    { "role": "config", "path": "katago-cpu.cfg" }
+  ],
+  "notes": "Historical general-purpose normal model selected for modest CPU cost. This configuration-specific 9x9 comparison has no human rank label. Windows runs the x64 Eigen executable on this ARM computer.",
+  "seed_documentation": "KataGo v1.18.1 default_gtp.cfg documents searchRandSeed and nnRandSeed. Both receive the arena identity seed. Single-thread search also has a wall-clock limit; independent stochastic play is not asserted, so confidence bounds remain unavailable.",
+  "seeded_stochastic": false,
+  "timeouts": {
+    "startup_ms": 120000,
+    "command_ms": 30000,
+    "shutdown_ms": 2000
+  }
+}

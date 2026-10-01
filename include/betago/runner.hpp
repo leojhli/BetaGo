@@ -8,6 +8,7 @@
 namespace betago {
 using Json = nlohmann::json;
 using Agent = std::function<Move(const GameState&)>;
+using AcceptedMoveObserver = std::function<void(const GameState&, Move, const GameState&)>;
 struct GameResult {
     GameState final_state;
     std::vector<Move> moves;
@@ -18,10 +19,14 @@ struct GameResult {
     std::optional<int> winner() const;
     Json to_json() const;
 };
-GameResult run_game(Agent black, Agent white, int size = 9, double komi = 7.5, int max_moves = 500);
+GameResult run_game(Agent black, Agent white, int size = 9, double komi = 7.5, int max_moves = 500,
+                    const AcceptedMoveObserver& observer = {});
 GameState replay_moves(const std::vector<Move>& moves, int size = 9, double komi = 7.5);
 std::vector<Move> moves_from_json(const Json& moves);
 Json load_records(const std::filesystem::path& path);
 std::string describe(const Json& record);
 void save_records(const std::filesystem::path& path, const Json& data);
+// Write a sibling temporary file, then replace the destination without exposing
+// a partially written JSON document. A failed replacement preserves the old file.
+void save_records_atomic(const std::filesystem::path& path, const Json& data);
 } // namespace betago
