@@ -2,6 +2,7 @@ param(
     [ValidateRange(1, 1000000)][int]$Iterations = 10,
     [string]$RunDirectory = 'results/selfplay',
     [string]$Checkpoint = '',
+    [double]$Komi = 7.5,
     [switch]$NoWatch
 )
 $ErrorActionPreference = 'Stop'
@@ -20,8 +21,10 @@ try {
     if (-not [IO.Path]::IsPathRooted($RunDirectory)) { $RunDirectory = Join-Path $PSScriptRoot $RunDirectory }
     $taskRunPath = [IO.Path]::GetFullPath($RunDirectory)
     $taskManifestPath = Join-Path $taskRunPath 'run.json'
+    if ([double]::IsNaN($Komi) -or [double]::IsInfinity($Komi)) { throw 'Komi must be finite.' }
     if (Test-Path -LiteralPath $taskManifestPath -PathType Leaf) {
         if ($Checkpoint) { throw 'A resumed run uses its saved model. Omit -Checkpoint or choose a new -RunDirectory.' }
+        if ($PSBoundParameters.ContainsKey('Komi')) { throw 'A resumed run uses its saved komi; omit -Komi.' }
         $taskManifest = Get-Content -LiteralPath $taskManifestPath -Raw | ConvertFrom-Json
         if ($taskManifest.kind -ne 'self_play_training_run' -or $taskManifest.schema_version -ne 1) {
             throw 'RunDirectory does not contain a supported training run.'
@@ -34,6 +37,9 @@ try {
     } else {
         if (Test-Path -LiteralPath $taskRunPath) { throw 'Choose a new run directory or a directory containing run.json.' }
         $taskTrainingArgs = @('--output', $taskRunPath)
+        if ($PSBoundParameters.ContainsKey('Komi')) {
+            $taskTrainingArgs += @('--komi', $Komi.ToString([Globalization.CultureInfo]::InvariantCulture))
+        }
         if ($Checkpoint) {
             if (-not [IO.Path]::IsPathRooted($Checkpoint)) { $Checkpoint = Join-Path $PSScriptRoot $Checkpoint }
             $taskCheckpointPath = [IO.Path]::GetFullPath($Checkpoint)

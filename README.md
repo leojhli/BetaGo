@@ -429,6 +429,18 @@ out-of-range values are rejected.
 
 ## Learn through self-play
 
+For supervised pretraining from SGF or installed KataGo teacher games, followed
+by the same self-play loop, run:
+
+```powershell
+.\pretrain.ps1 -Games 20 -Epochs 20 -Iterations 10
+```
+
+This opens the wooden-board viewer and uses a separate experiment directory.
+It freezes a copy of your current best model when available. See
+[expert pretraining](docs/expert_pretraining.md) for real SGF import, held-out
+validation, model selection, artifacts and native commands.
+
 Start or resume training with a live view of its actual games:
 
 ```powershell
