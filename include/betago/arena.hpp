@@ -36,6 +36,9 @@ using ArenaAgent = std::function<ArenaDecision(const GameState&)>;
 using ArenaAgentFactory = std::function<ArenaAgent(const AgentConfiguration&, std::int64_t)>;
 using ArenaProgress = std::function<void(int game_index, const Json& record)>;
 using ArenaSnapshot = std::function<void(const Json& report)>;
+// Called for each game's empty initial state (move_number == 0), then after
+// each legal move and session synchronization. game_index is zero based.
+using ArenaMoveProgress = std::function<void(int game_index, const GameState&, Move, int move_number)>;
 
 // A fresh session belongs to one game. Accepted moves are reported after local
 // legality succeeds; an external engine's own genmove must not be replayed.
@@ -70,7 +73,7 @@ PreparedAgent prepare_agent(const AgentConfiguration& configuration, int board_s
 // agent identities, and each game creates fresh agents with those same seeds.
 Json run_arena(const ArenaSettings& settings, const Json& metadata = Json::object(),
                const ArenaProgress& progress = {}, const ArenaAgentFactory& factory = {},
-               const ArenaSnapshot& snapshot = {});
+               const ArenaSnapshot& snapshot = {}, const ArenaMoveProgress& move_progress = {});
 
 // Aggregate outcomes only when a game ends by two passes. A color pair enters
 // the uncertainty bounds only when both of its games completed.

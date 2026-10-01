@@ -23,6 +23,9 @@ struct SelfPlayGame {
     std::vector<TrainingExample> examples;
 };
 using SelfPlayProgress = std::function<void(int, const GameState&, const SearchStatistics&)>;
+// The move is legal and already present in the state. Observation never owns
+// search, sampling, or the optimizer's random stream.
+using SelfPlayMoveProgress = std::function<void(int, const GameState&, Move)>;
 
 // Targets always use raw normalized root visits, independently of the
 // temperature used to select a self-play action.
@@ -31,7 +34,8 @@ std::size_t sample_policy(const std::vector<double>& policy, Random& random);
 
 SelfPlayGame run_self_play(std::shared_ptr<const PolicyValueNetwork> network,
                           const SelfPlaySettings& settings, std::int64_t seed,
-                          SelfPlayProgress progress = {});
+                          SelfPlayProgress progress = {},
+                          SelfPlayMoveProgress accepted_move = {});
 std::vector<TrainingExample> validate_self_play_game(const Json& record);
 Json self_play_dataset(const Json& games);
 } // namespace betago

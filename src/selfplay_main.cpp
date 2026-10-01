@@ -2,6 +2,7 @@
 #include "betago/options.hpp"
 #include "betago/replay.hpp"
 #include "betago/selfplay.hpp"
+#include "betago/training_live.hpp"
 #include "build_info.hpp"
 #include <algorithm>
 #include <bit>
@@ -15,6 +16,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <thread>
 #ifdef _WIN32
@@ -190,6 +192,38 @@ std::string attempt_directory(const Path& root, int iteration) {
     }
     throw std::runtime_error("Cannot allocate iteration directory");
 }
+class LiveFeed {
+public:
+    bool enabled() const { return static_cast<bool>(writer_); }
+    void enable(const Path& root) noexcept {
+        try { writer_ = std::make_unique<TrainingLiveWriter>(owned_path(root, "live.json")); }
+        catch (const std::exception& error) { disable(error.what()); }
+        catch (...) { disable("Unknown live-feed initialization error"); }
+    }
+    void publish(const GameState& state, Move last_move, int move_number, const Json& progress) noexcept {
+        if (!writer_) return;
+        try {
+            state_ = state; last_move_ = last_move; move_number_ = move_number;
+            writer_->publish(state, last_move, move_number, progress);
+        } catch (const std::exception& error) { disable(error.what()); }
+        catch (...) { disable("Unknown live-feed write error"); }
+    }
+    void stage(const Json& progress) noexcept {
+        if (!writer_ || !state_) return;
+        try { writer_->publish(*state_, last_move_, move_number_, progress); }
+        catch (const std::exception& error) { disable(error.what()); }
+        catch (...) { disable("Unknown live-feed write error"); }
+    }
+private:
+    std::unique_ptr<TrainingLiveWriter> writer_;
+    std::optional<GameState> state_;
+    Move last_move_;
+    int move_number_ = 0;
+    void disable(const char* reason) noexcept {
+        writer_.reset();
+        try { std::cerr << "Warning: live display disabled: " << reason << '\n'; } catch (...) {}
+    }
+};
 void help() {
     std::cout << "BetaGo CPU self-play training loop\n"
         << "selfplay.exe --output results/selfplay [--iterations 1] [--checkpoint MODEL]\n"
@@ -197,21 +231,23 @@ void help() {
         << "  --simulations 64 --c-puct 1.5 --temperature 1 --temperature-moves 20 --root-uniform-mix 0.25\n"
         << "  --replay-games 100 --updates 100 --batch-size 32 --learning-rate 0.01 --momentum 0.9 --l2 0.0001\n"
         << "  --channels 8 --value-hidden 16 --eval-simulations 64 --eval-pairs 1 --eval-max-moves 400\n"
-        << "  --promotion-score 0.55\n"
-        << "selfplay.exe --resume results/selfplay [--iterations 1]\n"
+        << "  --promotion-score 0.55 [--live]\n"
+        << "selfplay.exe --resume results/selfplay [--iterations 1] [--live]\n"
         << "New runs require a new directory. Resume restores all saved settings, replay and incumbent.\n"
         << "Completed games only provide value labels. Exit 2 means an iteration had no trainable replay.\n"
         << "best.json is the accepted model; every candidate and evaluation is kept.\n"
+        << "--live writes live.json with accepted moves and training progress for the board viewer.\n"
         << "Deterministic evaluation repeats the same color games across seed pairs; its gate is heuristic.\n";
 }
 } // namespace
 
 int main(int argc, char** argv) {
+    LiveFeed live;
     try {
         Options args(argc, argv, {"--output", "--resume", "--checkpoint", "--iterations", "--size", "--komi", "--seed", "--games",
             "--max-moves", "--simulations", "--c-puct", "--temperature", "--temperature-moves", "--root-uniform-mix",
             "--replay-games", "--updates", "--batch-size", "--learning-rate", "--momentum", "--l2", "--channels", "--value-hidden",
-            "--eval-simulations", "--eval-pairs", "--eval-max-moves", "--promotion-score"}, {"--help"});
+            "--eval-simulations", "--eval-pairs", "--eval-max-moves", "--promotion-score"}, {"--help", "--live"});
         if (args.has("--help")) { help(); return 0; }
         int iterations = args.integer("--iterations", 1);
         if (iterations < 1) throw std::invalid_argument("Iterations must be positive");
@@ -283,6 +319,12 @@ int main(int argc, char** argv) {
         if (replay.capacity() != settings.capacity || replay.board_size() != settings.play.board_size || replay.komi() != settings.play.komi)
             throw std::invalid_argument("Run replay settings disagree");
         refresh_best(root, incumbent_path);
+        if (args.has("--live")) {
+            live.enable(root);
+            live.publish(GameState::new_game(settings.play.board_size, settings.play.komi), PASS, 0,
+                {{"phase", "self_play"}, {"message", "Preparing self-play"}, {"iteration", first},
+                 {"game", 0}, {"games_total", settings.games}});
+        }
         std::cout << std::fixed << std::setprecision(5);
         bool skipped = false;
         for (int iteration = first; iteration < first + iterations; ++iteration) {
@@ -293,10 +335,24 @@ int main(int argc, char** argv) {
             Json games = Json::array(); int completed = 0;
             auto frozen = std::make_shared<const PolicyValueNetwork>(incumbent);
             for (int game = 0; game < settings.games; ++game) {
+                SelfPlayMoveProgress live_moves;
+                if (live.enabled()) {
+                    live.publish(GameState::new_game(settings.play.board_size, settings.play.komi), PASS, 0,
+                        {{"phase", "self_play"}, {"message", "Self-play game started"}, {"iteration", iteration},
+                         {"game", game + 1}, {"games_total", settings.games}});
+                    live_moves = [&](int move_number, const GameState& state, Move move) {
+                        if (live.enabled()) live.publish(state, move, move_number,
+                            {{"phase", "self_play"}, {"message", "Self-play"}, {"iteration", iteration},
+                             {"game", game + 1}, {"games_total", settings.games}});
+                    };
+                }
                 auto result = run_self_play(frozen, settings.play, iteration_seed(settings.seed, iteration, static_cast<std::uint64_t>(game)),
                     [&](int move, const GameState&, const SearchStatistics&) {
                         if (move % 25 == 0) std::cout << "  Game " << game + 1 << ": move " << move << '\n' << std::flush;
-                    });
+                    }, live_moves);
+                if (live.enabled()) live.stage({{"phase", "self_play"},
+                    {"message", result.record.at("termination_reason") == "two_passes" ? "Self-play game completed" : "Self-play game truncated"},
+                    {"iteration", iteration}, {"game", game + 1}, {"games_total", settings.games}});
                 if (replay.add(result.record)) ++completed;
                 games.push_back(std::move(result.record));
                 save_records(path / "games.json", {{"schema_version", 1}, {"kind", "self_play_batch"}, {"metadata", metadata()}, {"games", games}});
@@ -316,9 +372,14 @@ int main(int argc, char** argv) {
                 std::cout << "  No completed games: no value labels or training update.\n";
             } else {
                 auto candidate = incumbent;
+                if (live.enabled()) live.stage({{"phase", "training"}, {"message", "Training candidate"},
+                    {"iteration", iteration}, {"update", 0}, {"updates_total", settings.training.updates}});
                 report["training"] = train_candidate(candidate, replay, settings.training,
                     iteration_seed(settings.seed, iteration, UINT64_C(0x100000000)),
                     [&](int update, const LossMetrics& loss) {
+                        if (live.enabled()) live.stage({{"phase", "training"}, {"message", "Training candidate"},
+                            {"iteration", iteration}, {"update", update}, {"updates_total", settings.training.updates},
+                            {"policy_loss", loss.policy}, {"value_loss", loss.value}, {"total_loss", loss.total}});
                         if (update == 1 || update % 25 == 0 || update == settings.training.updates)
                             std::cout << "  Update " << update << ": CE " << loss.policy << ", value MSE " << loss.value << '\n' << std::flush;
                     });
@@ -330,9 +391,22 @@ int main(int argc, char** argv) {
                 arena.max_moves = settings.evaluation_max_moves;
                 // Reserve ample positive headroom for arena's pair seed arithmetic.
                 arena.seed = static_cast<std::int64_t>(static_cast<std::uint64_t>(iteration_seed(settings.seed, iteration, UINT64_C(0x200000000))) & UINT64_C(0x3fffffffffffffff));
+                ArenaMoveProgress live_evaluation;
+                if (live.enabled()) {
+                    live.stage({{"phase", "evaluation"}, {"message", "Evaluating candidate against incumbent"},
+                        {"iteration", iteration}, {"game", 0}, {"games_total", settings.evaluation_pairs * 2}});
+                    live_evaluation = [&](int game, const GameState& state, Move move, int move_number) {
+                        if (live.enabled()) live.publish(state, move, move_number,
+                            {{"phase", "evaluation"}, {"message", "Candidate evaluation"}, {"iteration", iteration},
+                             {"game", game + 1}, {"games_total", settings.evaluation_pairs * 2}});
+                    };
+                }
                 auto evaluation = run_arena(arena, metadata(), [&](int game, const Json& record) {
+                    if (live.enabled()) live.stage({{"phase", "evaluation"},
+                        {"message", record.at("termination_reason") == "two_passes" ? "Evaluation game completed" : "Evaluation game truncated"},
+                        {"iteration", iteration}, {"game", game + 1}, {"games_total", settings.evaluation_pairs * 2}});
                     std::cout << "  Evaluation " << game + 1 << ": " << record.at("termination_reason") << '\n' << std::flush;
-                });
+                }, {}, {}, live_evaluation);
                 // PUCT from an empty board is deterministic. Repeating a color
                 // pairing adds no independent samples, so suppress such bounds.
                 evaluation["evaluation_sampling"] = {{"deterministic", true}, {"independent_seed_pairs", false},
@@ -366,10 +440,17 @@ int main(int argc, char** argv) {
             manifest["replay_fingerprint_fnv1a64"] = fingerprint(path / "replay.json");
             commit_json(owned_path(root, "run.json"), manifest);
             refresh_best(root, incumbent_path);
+            if (live.enabled()) live.stage({{"phase", "iteration_complete"},
+                {"message", report.at("status") == "skipped_no_completed_games" ? "Iteration skipped: no completed games" :
+                    report.at("promoted").get<bool>() ? "Iteration complete: candidate accepted" : "Iteration complete: incumbent retained"},
+                {"iteration", iteration}});
         }
+        if (live.enabled()) live.stage({{"phase", "finished"}, {"message", "Training run finished"},
+            {"iteration", first + iterations - 1}});
         std::cout << "Saved run to " << root.string() << "; accepted model: " << (root / "best.json").string() << '\n';
         return skipped ? 2 : 0;
     } catch (const std::exception& error) {
+        try { if (live.enabled()) live.stage({{"phase", "error"}, {"message", error.what()}}); } catch (...) {}
         std::cerr << "Error: " << error.what() << '\n'; return 1;
     }
 }

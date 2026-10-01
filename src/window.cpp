@@ -91,6 +91,14 @@ int GoWindow::callback(void* data, Tcl_Interp*, int count, Tcl_Obj* const object
 void GoWindow::action(const std::vector<std::string>& args) {
     if (args.empty()) throw std::invalid_argument("Missing visual action");
     const auto& name = args[0];
+    if (training_watch_) {
+        if (name == "training_step") training_step();
+        else if (name == "pause_view") pause_training_view();
+        else if (name == "follow_live") follow_training_live();
+        else if (name == "close") close();
+        // A spectator never submits moves or changes the trainer's modes.
+        return;
+    }
     if (name == "click" && args.size() == 3) click(std::stoi(args[1]), std::stoi(args[2]));
     else if (name == "pass") {
         if (computer_turn()) notice("Wait for the computer's move, or stop MCTS to take over.");
@@ -105,6 +113,7 @@ void GoWindow::action(const std::vector<std::string>& args) {
     else if (name == "mcts") toggle_mcts(false);
     else if (name == "watch_mcts") toggle_mcts(true);
     else if (name == "mcts_step") mcts_step();
+    else if (name == "training_step") training_step();
     else if (name == "close") close();
     else throw std::invalid_argument("Unknown visual action");
 }
@@ -192,16 +201,17 @@ void GoWindow::draw() {
         status << (!winner ? "Draw" : *winner == BLACK ? "Black wins" : "White wins")
                << "  |  Black " << score.black << " - White " << score.white;
     } else if (random_truncated_) status << "Truncated at " << history_.size() << " moves  |  No final score";
-    else status << (state_.to_play() == BLACK ? "Black" : "White") << " to play  |  Move " << history_.size() + 1
+    else status << (state_.to_play() == BLACK ? "Black" : "White") << " to play  |  Move " << (training_watch_ ? training_move_number_ : static_cast<int>(history_.size()) + 1)
                 << "  |  Passes " << state_.consecutive_passes() << "/2";
     out << "set status " << tcl_quote(status.str()) << '\n';
     bool watching = !demo_job_.empty() || !random_job_.empty() || computer_turn();
-    out << ".p.buttons.pass configure -state " << (state_.is_terminal() || watching ? "disabled" : "normal") << '\n';
-    out << ".p.buttons.undo configure -state " << (history_.empty() ? "disabled" : "normal") << '\n';
+    out << ".p.buttons.pass configure -state " << (training_watch_ || state_.is_terminal() || watching ? "disabled" : "normal") << '\n';
+    out << ".p.buttons.undo configure -state " << (training_watch_ || history_.empty() ? "disabled" : "normal") << '\n';
     tk_.eval(out.str());
 }
 
 void GoWindow::click(int x, int y) {
+    if (training_watch_) return;
     if (!demo_job_.empty() || !random_job_.empty()) { notice("Stop playback to play your own moves."); return; }
     if (computer_turn()) { notice("Wait for the computer's move, or stop MCTS to take over."); return; }
     int column = static_cast<int>(std::nearbyint((x - MARGIN) / double(SPACING)));
@@ -212,6 +222,7 @@ void GoWindow::click(int x, int y) {
 }
 
 void GoWindow::play(Move move) {
+    if (training_watch_) return;
     auto successor = state_;
     try { successor = state_.play(move); }
     catch (const IllegalMove& error) { notice(error.what()); return; }
@@ -251,11 +262,13 @@ void GoWindow::stop_random() {
     mode("9 x 9   /   Local play   /   Komi 7.5");
 }
 void GoWindow::new_game() {
+    if (training_watch_) return;
     stop_demo(); stop_random(); stop_mcts();
     state_ = GameState::new_game(); history_.clear(); last_move_.reset(); random_truncated_ = false;
     notice("Click an intersection to place a stone."); draw();
 }
 void GoWindow::undo() {
+    if (training_watch_) return;
     stop_demo(); stop_random(); stop_mcts(); random_truncated_ = false;
     if (!history_.empty()) {
         state_ = history_.back().first; last_move_ = history_.back().second; history_.pop_back(); notice("Move undone.");
@@ -263,6 +276,7 @@ void GoWindow::undo() {
     draw();
 }
 void GoWindow::toggle_demo() {
+    if (training_watch_) return;
     if (!demo_job_.empty()) { stop_demo(); notice("Demo stopped. You can continue playing this position."); draw(); return; }
     new_game(); demo_index_ = 0;
     tk_.eval(".p.buttons.demo configure -text {Stop demo}");
@@ -279,6 +293,7 @@ void GoWindow::demo_step() {
 }
 void GoWindow::start_random() { toggle_random(); }
 void GoWindow::toggle_random() {
+    if (training_watch_) return;
     if (!random_job_.empty()) { stop_random(); notice("Random game stopped. You can continue playing this position."); draw(); return; }
     new_game(); black_ = RandomAgent(seed_); white_ = RandomAgent(seed_ + 1);
     mode("9 x 9   /   Random vs random   /   Seed " + std::to_string(seed_) + "   /   Komi 7.5");
@@ -312,6 +327,7 @@ void GoWindow::stop_mcts() {
 }
 void GoWindow::start_mcts(bool watch) { toggle_mcts(watch); }
 void GoWindow::toggle_mcts(bool watch) {
+    if (training_watch_) return;
     if (mcts_mode_ && mcts_watch_ == watch) {
         stop_mcts(); notice(search_name() + " stopped. You can continue playing this position."); draw(); return;
     }
@@ -366,7 +382,145 @@ void GoWindow::mcts_step() {
     if (mcts_mode_) notice("Last search: " + std::to_string(stats.simulations) + " simulations, " +
         std::to_string(stats.truncated_rollouts) + " rollouts cut off. " + (mcts_watch_ ? "Watching MCTS vs random." : "Your turn as Black."));
 }
-void GoWindow::close() { stop_demo(); stop_random(); stop_mcts(); tk_.eval("destroy ."); }
+void GoWindow::start_training_watch(const std::filesystem::path& path) {
+    if (path.empty()) throw std::invalid_argument("A training snapshot path is required");
+    stop_demo(); stop_random(); stop_mcts(); stop_training_watch();
+    network_.reset(); history_.clear(); last_move_.reset(); random_truncated_ = false;
+    state_ = GameState::new_game(); training_move_number_ = 0;
+    training_path_ = path; training_latest_.reset(); training_read_error_.clear();
+    training_watch_ = true; training_paused_ = false;
+    tk_.eval(R"TK(
+wm title . {BetaGo - Live training}
+.p.mode configure -wraplength 540
+foreach widget {.p.buttons.pass .p.buttons.undo .p.buttons.new .p.buttons.demo .p.watch.random .p.watch.human .p.watch.mcts} {
+    $widget configure -state disabled
+}
+pack forget .p.buttons .p.watch
+if {![winfo exists .p.training]} {
+    ttk::frame .p.training
+    ttk::button .p.training.pause -text {Pause view} -command {betago pause_view}
+    ttk::button .p.training.follow -text {Follow live} -command {betago follow_live}
+    pack .p.training.pause -side left
+    pack .p.training.follow -side left -padx 6
+}
+pack .p.training -fill x -pady {12 0} -before .p.footer
+.p.training.pause configure -state normal -text {Pause view}
+.p.training.follow configure -state disabled
+.p.footer configure -text {Read-only view. Pausing or closing this board leaves training running.}
+)TK");
+    mode("9 x 9   /   Watching training   /   Waiting for updates");
+    notice("Waiting for training to publish its first position.");
+    draw(); training_step();
+}
+
+void GoWindow::schedule_training() {
+    if (training_watch_ && training_job_.empty())
+        training_job_ = tk_.eval("after 100 {betago training_step}");
+}
+
+void GoWindow::training_step() {
+    training_job_.clear();
+    if (!training_watch_) return;
+    try {
+        auto snapshot = read_training_live(training_path_);
+        if (snapshot.state.size() != 9)
+            throw std::invalid_argument("The visual training board requires a 9x9 run");
+        bool advanced = !training_latest_ || snapshot.session_id != training_latest_->session_id ||
+                        snapshot.sequence > training_latest_->sequence;
+        training_read_error_.clear();
+        if (advanced) {
+            training_latest_ = std::move(snapshot);
+            if (!training_paused_) display_training();
+        }
+        notice(training_message());
+    } catch (const std::exception& error) {
+        training_read_error_ = std::string(error.what()).substr(0, 180);
+        notice(training_message());
+    }
+    // Always keep following the feed: completed runs can be followed by a new
+    // training session, and a transient missing or malformed file can recover.
+    schedule_training();
+}
+
+std::string GoWindow::training_message() const {
+    if (training_paused_)
+        return "View paused. Training continues; choose Follow live to show its latest position.";
+    if (!training_latest_)
+        return "Waiting for training updates. " + training_read_error_;
+    const auto& progress = training_latest_->progress;
+    std::ostringstream text;
+    if (progress.contains("message") && progress["message"].is_string())
+        text << progress["message"].get<std::string>();
+    auto add_number = [&](const char* key, const char* label) {
+        if (!progress.contains(key) || !progress[key].is_number()) return;
+        if (text.tellp() > 0) text << "  |  ";
+        text << label << ' ' << std::setprecision(5) << progress[key].get<double>();
+    };
+    if (progress.contains("update") && progress["update"].is_number_integer()) {
+        if (text.tellp() > 0) text << "  |  ";
+        text << "Update " << progress["update"].get<int>();
+        if (progress.contains("updates_total")) text << '/' << progress["updates_total"].get<int>();
+    }
+    if (progress.contains("total_loss")) add_number("total_loss", "Loss");
+    else add_number("loss", "Loss");
+    add_number("policy_loss", "Policy"); add_number("value_loss", "Value");
+    if (!training_read_error_.empty()) {
+        if (text.tellp() > 0) text << ". ";
+        text << "Waiting for a valid update; showing the last position. " << training_read_error_;
+    } else {
+        const auto phase = progress.value("phase", std::string{});
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto age_ms = now - training_latest_->updated_at_ms;
+        if (phase != "finished" && phase != "error" && age_ms > 15000) {
+            if (text.tellp() > 0) text << ". ";
+            text << "No new update for " << age_ms / 1000 << " seconds; training may still be working.";
+        }
+    }
+    if (text.tellp() == 0) text << "Following live training. This view does not control the trainer.";
+    return text.str();
+}
+
+void GoWindow::display_training() {
+    if (!training_latest_ || training_paused_) return;
+    state_ = training_latest_->state; last_move_ = training_latest_->last_move;
+    training_move_number_ = training_latest_->move_number;
+    const auto& progress = training_latest_->progress;
+    const auto phase = progress.value("phase", std::string{});
+    std::string label = phase == "self_play" ? "Self-play" : phase == "training" ? "Updating network" :
+                        phase == "evaluation" ? "Evaluating candidate" : phase == "finished" ? "Training finished" :
+                        phase == "error" ? "Training stopped with an error" : phase == "iteration_complete" ? "Iteration complete" : "Starting training";
+    std::ostringstream line;
+    line << "9 x 9   /   " << label;
+    if (progress.contains("iteration")) line << "   /   Iteration " << progress["iteration"].get<int>();
+    if (progress.contains("game")) {
+        line << "   /   Game " << progress["game"].get<int>();
+        if (progress.contains("games_total")) line << '/' << progress["games_total"].get<int>();
+    }
+    line << "   /   Komi " << state_.komi();
+    mode(line.str()); draw(); notice(training_message());
+}
+
+void GoWindow::pause_training_view() {
+    if (!training_watch_) return;
+    training_paused_ = true;
+    tk_.eval(".p.training.pause configure -state disabled; .p.training.follow configure -state normal");
+    notice(training_message());
+}
+
+void GoWindow::follow_training_live() {
+    if (!training_watch_) return;
+    training_paused_ = false;
+    tk_.eval(".p.training.pause configure -state normal; .p.training.follow configure -state disabled");
+    display_training(); notice(training_message());
+}
+
+void GoWindow::stop_training_watch() {
+    if (!training_job_.empty()) { tk_.eval("after cancel " + tcl_quote(training_job_)); training_job_.clear(); }
+    training_watch_ = false;
+}
+
+void GoWindow::close() { stop_training_watch(); stop_demo(); stop_random(); stop_mcts(); tk_.eval("destroy ."); }
 
 void GoWindow::self_test() {
     // Exercise the original modes first, regardless of startup options.
@@ -572,9 +726,92 @@ void GoWindow::self_test() {
     tk_.eval(".p.watch.mcts invoke");
     tk_.eval("after cancel " + tcl_quote(mcts_job_)); mcts_step();
     check(neural_search_ && !mcts_job_.empty(), "partial neural tree before close");
+
+    const auto feed_path = std::filesystem::temp_directory_path() /
+        ("betago_gui_training_" + std::to_string(GetCurrentProcessId()) + "_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+    struct RemoveFeed {
+        std::filesystem::path path;
+        ~RemoveFeed() { std::error_code error; std::filesystem::remove(path, error); }
+    } remove_feed{feed_path};
+    auto poll_feed = [&] {
+        if (!training_job_.empty()) tk_.eval("after cancel " + tcl_quote(training_job_));
+        training_step();
+    };
+    start_training_watch(feed_path);
+    check(!neural_search_ && !neural_agent_ && !network_ && !mcts_mode_ && mcts_job_.empty(), "training viewer releases local search and model");
+    check(!training_job_.empty() && tk_.eval("set notice").find("Waiting for training updates") != std::string::npos,
+          "viewer waits for a missing feed and keeps polling");
+    TrainingLiveWriter feed(feed_path);
+    auto live_state = GameState::new_game(9, 6.5).play(Point{0, 0});
+    feed.publish(live_state, Point{0, 0}, 1,
+                 {{"phase", "self_play"}, {"message", "Generating self-play data"}, {"iteration", 42}, {"game", 1}, {"games_total", 2}});
+    poll_feed();
+    check(state_ == live_state && last_move_ == Move(Point{0, 0}) && training_move_number_ == 1,
+          "viewer displays a complete live position and last move");
+    check(tk_.eval("set mode").find("Iteration 42") != std::string::npos && tk_.eval("set mode").find("Game 1/2") != std::string::npos &&
+          tk_.eval("set mode").find("Komi 6.5") != std::string::npos, "viewer shows live iteration game and komi");
+    check(tk_.eval(".p.buttons.pass cget -state") == "disabled" && tk_.eval(".p.buttons.new cget -state") == "disabled",
+          "spectator disables local controls");
+    tk_.eval("event generate .p.board <Button-1> -x 110 -y 110; betago pass; betago undo; betago new; betago demo; betago random; betago mcts; betago watch_mcts");
+    click(110, 110); play(PASS); new_game(); undo();
+    check(state_ == live_state && history_.empty() && demo_job_.empty() && random_job_.empty() && mcts_job_.empty(),
+          "spectator cannot place moves undo reset or start another mode");
+    tk_.eval(".p.training.pause invoke");
+    auto next_live_state = live_state.play(Point{0, 1});
+    feed.publish(next_live_state, Point{0, 1}, 2, {{"phase", "self_play"}, {"message", "Next training move"}});
+    poll_feed();
+    check(training_paused_ && state_ == live_state && training_latest_->state == next_live_state,
+          "pause freezes the view while the feed continues");
+    tk_.eval(".p.training.follow invoke");
+    check(!training_paused_ && state_ == next_live_state && last_move_ == Move(Point{0, 1}), "follow jumps to the latest training position");
+    feed.publish(next_live_state, Point{0, 1}, 2,
+                 {{"phase", "training"}, {"message", "Updating candidate"}, {"update", 2}, {"updates_total", 10},
+                  {"total_loss", 1.2}, {"policy_loss", 0.8}, {"value_loss", 0.4}});
+    poll_feed();
+    check(tk_.eval("set mode").find("Updating network") != std::string::npos &&
+          tk_.eval("set notice").find("Update 2/10") != std::string::npos && tk_.eval("set notice").find("Loss 1.2") != std::string::npos,
+          "viewer displays optimizer phase update counts and losses");
+    { std::ofstream invalid(feed_path); invalid << "{broken"; }
+    poll_feed();
+    check(state_ == next_live_state && !training_job_.empty() && tk_.eval("set notice").find("Waiting for a valid update") != std::string::npos,
+          "malformed feed retains the last valid board and polling");
+    std::filesystem::remove(feed_path); poll_feed();
+    check(state_ == next_live_state && !training_job_.empty(), "missing feed retains the last valid board");
+    feed.publish(next_live_state, Point{0, 1}, 2, {{"phase", "evaluation"}, {"message", "Comparing candidate with incumbent"}});
+    poll_feed();
+    check(tk_.eval("set mode").find("Evaluating candidate") != std::string::npos && training_read_error_.empty(), "viewer recovers from a malformed or missing feed");
+    Json old_update;
+    { std::ifstream stream(feed_path); stream >> old_update; }
+    old_update["sequence"] = old_update["sequence"].get<std::uint64_t>() + 1;
+    old_update["updated_at_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count() - 20000;
+    { std::ofstream stream(feed_path); stream << old_update; }
+    poll_feed();
+    check(tk_.eval("set notice").find("No new update") != std::string::npos &&
+          tk_.eval("set mode").find("finished") == std::string::npos, "stale feed does not claim training has finished");
+    const auto old_session = training_latest_->session_id;
+    TrainingLiveWriter next_feed(feed_path);
+    auto restarted = GameState::new_game().play(Point{8, 8});
+    next_feed.publish(restarted, Point{8, 8}, 1, {{"phase", "self_play"}, {"message", "A new training run"}, {"iteration", 43}});
+    poll_feed();
+    check(state_ == restarted && training_latest_->session_id != old_session && training_latest_->sequence == 1,
+          "fresh session resets sequence and replaces the old board");
+    next_feed.publish(GameState::new_game(19), PASS, 0, {{"phase", "self_play"}, {"message", "Unsupported visual size"}});
+    poll_feed();
+    check(state_ == restarted && tk_.eval("set notice").find("9x9") != std::string::npos,
+          "unsupported board size retains the last valid board");
+    auto final_live_state = restarted.play(PASS).play(PASS);
+    next_feed.publish(final_live_state, PASS, 3, {{"phase", "finished"}, {"message", "Training finished"}});
+    poll_feed();
+    check(state_ == final_live_state && tk_.eval("set mode").find("Training finished") != std::string::npos && !training_job_.empty(),
+          "completed feed keeps its final board visible and follows future sessions");
     close();
-    check(!neural_search_ && !neural_agent_ && !mcts_mode_ && tk_.eval("after info").empty(), "close destroys partial neural tree and callbacks");
-    std::cout << "GUI checks passed: clicks, passes, seeded playback, truncation, stop, undo, reset, demo, incremental classical/neural MCTS, PUCT progress, cancellation and close.\n";
+    check(!neural_search_ && !neural_agent_ && !mcts_mode_ && !training_watch_ && training_job_.empty() && tk_.eval("after info").empty(),
+          "close cancels local searches and spectator callbacks");
+    next_feed.publish(restarted, Point{8, 8}, 1, {{"phase", "self_play"}, {"message", "Trainer continues after viewer closes"}});
+    check(read_training_live(feed_path).state == restarted, "closing the spectator leaves the training publisher usable");
+    std::cout << "GUI checks passed: clicks, passes, seeded playback, truncation, stop, undo, reset, demo, incremental classical/neural MCTS, PUCT progress, live training updates, read-only controls, pause/follow, feed recovery, fresh sessions and close.\n";
 }
 
 void GoWindow::dump_canvas(const std::filesystem::path& path) {

@@ -3,6 +3,7 @@
 #include "mcts.hpp"
 #include "neural_mcts.hpp"
 #include "tk.hpp"
+#include "training_live.hpp"
 #include <iosfwd>
 #include <utility>
 
@@ -13,6 +14,7 @@ public:
              std::shared_ptr<const PolicyValueNetwork> network = {}, NeuralMctsSettings neural_settings = {});
     void start_random();
     void start_mcts(bool watch = false);
+    void start_training_watch(const std::filesystem::path& path);
     void run() { tk_.loop(); }
     void self_test();
     void dump_canvas(const std::filesystem::path& path);
@@ -37,6 +39,12 @@ private:
     std::unique_ptr<NeuralMctsAgent> neural_agent_;
     std::unique_ptr<NeuralMctsSearch> neural_search_;
     bool mcts_mode_ = false, mcts_watch_ = false;
+    bool training_watch_ = false, training_paused_ = false;
+    std::filesystem::path training_path_;
+    std::string training_job_;
+    std::optional<TrainingLiveSnapshot> training_latest_;
+    int training_move_number_ = 0;
+    std::string training_read_error_;
     static int callback(void* data, Tcl_Interp*, int count, Tcl_Obj* const objects[]);
     void action(const std::vector<std::string>& args);
     void draw_board();
@@ -59,6 +67,13 @@ private:
     void toggle_mcts(bool watch);
     void schedule_mcts();
     void mcts_step();
+    void training_step();
+    void schedule_training();
+    void display_training();
+    std::string training_message() const;
+    void pause_training_view();
+    void follow_training_live();
+    void stop_training_watch();
     void close();
     void notice(const std::string& message);
     void mode(const std::string& message);

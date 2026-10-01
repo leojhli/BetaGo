@@ -528,7 +528,7 @@ Json arena_report(const ArenaSettings& settings, const Json& metadata,
 
 Json run_external_arena(const ArenaSettings& settings, const Json& metadata,
                         const ArenaProgress& progress, const ArenaAgentFactory& factory,
-                        const ArenaSnapshot& snapshot, const PreparedAgent& prepared_a,
+                        const ArenaSnapshot& snapshot, const ArenaMoveProgress& move_progress, const PreparedAgent& prepared_a,
                         const PreparedAgent& prepared_b) {
     Json games = Json::array();
     const bool eligible = (!settings.a.external_gtp || settings.a.external_gtp->seeded_stochastic()) &&
@@ -539,6 +539,8 @@ Json run_external_arena(const ArenaSettings& settings, const Json& metadata,
             const bool a_black = in_pair == 1;
             const auto started = std::chrono::steady_clock::now();
             auto prefix_state = GameState::new_game(settings.size, settings.komi);
+            const int game_index = static_cast<int>(games.size());
+            if (move_progress) move_progress(game_index, prefix_state, PASS, 0);
             std::vector<Move> prefix;
             Json decisions = Json::array(), failure = nullptr, resigned_by = nullptr;
             Json cleanup_warnings = Json::array(), external_sessions = Json::object();
@@ -596,6 +598,7 @@ Json run_external_arena(const ArenaSettings& settings, const Json& metadata,
                     phase = "accepted_move";
                     active_actor = "a"; a.accepted(before.to_play(), move, own_a);
                     active_actor = "b"; b.accepted(before.to_play(), move, !own_a);
+                    if (move_progress) move_progress(game_index, after, move, static_cast<int>(prefix.size()));
                 };
                 auto result = run_game(choose, choose, settings.size, settings.komi, settings.max_moves, accepted);
                 prefix_state = std::move(result.final_state);
@@ -672,14 +675,14 @@ Json run_external_arena(const ArenaSettings& settings, const Json& metadata,
 
 Json run_arena(const ArenaSettings& settings, const Json& metadata,
                const ArenaProgress& progress, const ArenaAgentFactory& factory,
-               const ArenaSnapshot& snapshot) {
+               const ArenaSnapshot& snapshot, const ArenaMoveProgress& move_progress) {
     settings.validate();
     if (!metadata.is_object()) throw std::invalid_argument("Arena metadata must be an object");
     Json games = Json::array();
     const auto prepared_a = prepare_agent(settings.a, settings.size);
     const auto prepared_b = prepare_agent(settings.b, settings.size);
     if (settings.a.external_gtp || settings.b.external_gtp)
-        return run_external_arena(settings, metadata, progress, factory, snapshot, prepared_a, prepared_b);
+        return run_external_arena(settings, metadata, progress, factory, snapshot, move_progress, prepared_a, prepared_b);
     for (int pair = 0; pair < settings.pairs; ++pair) {
         std::int64_t a_seed = settings.seed + 2LL * pair, b_seed = a_seed + 1;
         for (int game_in_pair = 1; game_in_pair <= 2; ++game_in_pair) {
@@ -691,6 +694,8 @@ Json run_arena(const ArenaSettings& settings, const Json& metadata,
             bool a_black = game_in_pair == 1;
             Json decisions = Json::array();
             Count move_number = 0;
+            const int game_index = static_cast<int>(games.size());
+            if (move_progress) move_progress(game_index, GameState::new_game(settings.size, settings.komi), PASS, 0);
             auto choose = [&](const GameState& state) {
                 bool use_a = (state.to_play() == BLACK) == a_black;
                 auto started = std::chrono::steady_clock::now();
@@ -706,7 +711,11 @@ Json run_arena(const ArenaSettings& settings, const Json& metadata,
                 decisions.push_back(std::move(record));
                 return decision.move;
             };
-            auto result = run_game(choose, choose, settings.size, settings.komi, settings.max_moves);
+            AcceptedMoveObserver accepted;
+            if (move_progress) accepted = [&](const GameState&, Move move, const GameState& after) {
+                move_progress(game_index, after, move, static_cast<int>(move_number));
+            };
+            auto result = run_game(choose, choose, settings.size, settings.komi, settings.max_moves, accepted);
             Json game = result.to_json();
             game["pair_index"] = pair; game["game_in_pair"] = game_in_pair;
             game["black_agent"] = a_black ? "a" : "b";

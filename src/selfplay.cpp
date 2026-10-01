@@ -207,7 +207,7 @@ std::size_t sample_policy(const std::vector<double>& policy, Random& random) {
 
 SelfPlayGame run_self_play(std::shared_ptr<const PolicyValueNetwork> network,
                           const SelfPlaySettings& settings, std::int64_t seed,
-                          SelfPlayProgress progress) {
+                          SelfPlayProgress progress, SelfPlayMoveProgress accepted_move) {
     ProfileScope scope(ProfileWork::SelfPlay);
     settings.validate();
     if (!network) throw std::invalid_argument("Self-play requires a network");
@@ -251,6 +251,7 @@ SelfPlayGame run_self_play(std::shared_ptr<const PolicyValueNetwork> network,
         if (progress) progress(ply, state, statistics);
         state = state.play(move);
         moves.push_back(move);
+        if (accepted_move) accepted_move(ply + 1, state, move);
     }
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     Json record = GameResult{state, moves, settings.max_moves, elapsed}.to_json();

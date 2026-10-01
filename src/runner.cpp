@@ -323,9 +323,18 @@ void save_records_atomic(const std::filesystem::path& path, const Json& data) {
         if (!stream) throw std::runtime_error("Cannot close " + temporary.string());
     }
 #ifdef _WIN32
-    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-        throw std::runtime_error("Cannot atomically replace " + path.string() +
-                                 " (Windows error " + std::to_string(GetLastError()) + ")");
+    // Readers, antivirus and the sync provider can briefly hold a file during
+    // replacement. Keep the old complete document available while retrying.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    for (;;) {
+        if (MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) break;
+        const auto error = GetLastError();
+        if ((error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) ||
+            std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("Cannot atomically replace " + path.string() +
+                                     " (Windows error " + std::to_string(error) + ")");
+        Sleep(5);
+    }
 #else
     std::filesystem::rename(temporary, path);
 #endif

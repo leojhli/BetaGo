@@ -120,6 +120,32 @@ Json recorded_sequence(int size, double komi, const std::vector<Move>& moves) {
 
 int run_selfplay_tests() {
     Suite suite;
+    suite.test("accepted-move observations follow legal history without changing seeded targets", [] {
+        auto settings = tiny_settings();
+        settings.board_size = 3; settings.max_moves = 40; settings.search.simulations = 8;
+        auto network = model(3);
+        auto expected = run_self_play(network, settings, 11);
+        auto observed_state = GameState::new_game(3, settings.komi);
+        std::vector<Move> observed_moves;
+        auto actual = run_self_play(network, settings, 11, {},
+            [&](int number, const GameState& state, Move move) {
+                observed_state = observed_state.play(move);
+                observed_moves.push_back(move);
+                check(number == static_cast<int>(observed_moves.size()) && state == observed_state,
+                      "Spectator received a position before legal acceptance");
+            });
+        check(observed_moves == moves_from_json(actual.record.at("moves")));
+        check(without_timing(actual.record) == without_timing(expected.record),
+              "Observing self-play changed targets or random sampling");
+        same_examples(actual.examples, expected.examples);
+        int passes = 0;
+        run_self_play(model(), tiny_settings(), 0, {},
+            [&](int number, const GameState& state, Move move) {
+                check(!move && state.consecutive_passes() == number);
+                ++passes;
+            });
+        check(passes == 2, "Final pass was missing from the live view");
+    });
     suite.test("visit targets normalize all root children and keep pass and illegal actions separate", [] {
         auto state = GameState::new_game(3, 0.5).play(Point{0, 0});
         SearchStatistics search; search.algorithm = "puct";

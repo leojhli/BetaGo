@@ -15,6 +15,7 @@ int run_neural_arena_tests();
 int run_selfplay_tests();
 int run_performance_tests();
 int run_gtp_tests(const std::filesystem::path& fake_exe);
+int run_training_live_tests();
 
 void check(bool condition, const std::string& message = "Unexpected result") {
     if (!condition) throw std::runtime_error(message);
@@ -304,5 +305,6 @@ int main(int argc, char** argv) {
     int selfplay_failures = run_selfplay_tests();
     int performance_failures = run_performance_tests();
     int gtp_failures = run_gtp_tests(fake_exe);
-    return suite.failed || search_failures || arena_failures || neural_failures || puct_failures || neural_arena_failures || selfplay_failures || performance_failures || gtp_failures ? 1 : 0;
+    int live_failures = run_training_live_tests();
+    return suite.failed || search_failures || arena_failures || neural_failures || puct_failures || neural_arena_failures || selfplay_failures || performance_failures || gtp_failures || live_failures ? 1 : 0;
 }

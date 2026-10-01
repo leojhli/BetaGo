@@ -92,6 +92,24 @@ void truncate_game(Json& record, int limit = 1) {
 
 int run_arena_tests() {
     ArenaSuite suite;
+    suite.test("live evaluation observations preserve game boundaries passes and results", [] {
+        auto settings = pass_settings(1);
+        int initial = 0, accepted = 0;
+        std::vector<GameState> states;
+        auto observed = run_arena(settings, Json::object(), {}, pass_factory(), {},
+            [&](int game, const GameState& state, Move move, int number) {
+                arena_check(game >= 0 && game < 2 && !move);
+                if (number == 0) {
+                    ++initial; states.push_back(GameState::new_game(settings.size, settings.komi));
+                } else {
+                    ++accepted; states.at(game) = states.at(game).play(move);
+                }
+                arena_check(state == states.at(game) && state.consecutive_passes() == number,
+                            "Live evaluation did not follow accepted legal history");
+            });
+        arena_check(initial == 2 && accepted == 4 && states[0].is_terminal() && states[1].is_terminal());
+        arena_check(without_timing(observed) == without_timing(pass_arena(1)));
+    });
     suite.test("both colors use fresh agents and the same identity seeds within a pair", [] {
         auto settings = pass_settings(2);
         std::vector<std::pair<std::int64_t, int>> calls;

@@ -429,17 +429,52 @@ out-of-range values are rejected.
 
 ## Learn through self-play
 
-Run a first 9x9 iteration from a fresh seeded network, then open the accepted
-checkpoint in the same visual board:
+Start or resume training with a live view of its actual games:
+
+```powershell
+.\train.ps1 -Iterations 10
+```
+
+The shortcut resumes `results/selfplay` with its saved settings, replay and
+accepted model, and opens the same wooden board as a read-only viewer. If the
+directory does not exist, it creates a new 9x9 training run. Both self-play and
+candidate evaluation moves appear live. The board shows iteration/game counts;
+while weights update, it shows update counts and losses beside the last game
+position. **Pause view** freezes the display; **Follow live** returns to the
+latest position. Closing the viewer leaves training running. Use Ctrl+C in the
+training terminal to stop; resume continues from the last completed iteration.
+
+`-Iterations` is the number of additional iterations to run. Use
+`-RunDirectory results/another_run` for a separate run, `-Checkpoint
+results/selfplay/best.json` to initialize a new run from an existing model,
+or `-NoWatch` to train without opening the viewer. A resumed run keeps its
+saved model and settings.
+
+The equivalent commands, in separate terminals, are:
+
+```powershell
+.\build\selfplay.exe --resume results/selfplay --iterations 10 --live
+.\build\play.exe --watch-training results/selfplay/live.json
+```
+
+`--live` publishes atomic snapshots to the run's `live.json`; the viewer polls
+the latest position without running searches or updating weights. It keeps the
+last valid board if an update is missing or malformed, and follows a resumed
+session automatically. Display errors are reported without stopping training.
+Small/large board training remains available in the CLI; this viewer supports
+9x9. KataGo matches evaluate the checkpoint separately from self-play training.
+
+To run a first iteration in a new directory, then play against its accepted
+checkpoint:
 
 ```powershell
 .\build\selfplay.exe --output results/selfplay --iterations 1
 .\build\play.exe --neural --checkpoint results/selfplay/best.json
 ```
 
-Training runs in the console and writes checkpoints; `play.exe` displays the
-board. The wooden board, shaded stones, coordinates and controls stay the same.
-The GUI loads a checkpoint when it starts; reopen it to use a later checkpoint.
+The interactive game loads a checkpoint when it starts; reopen it to use a
+later accepted checkpoint. Its wooden board, shaded stones and coordinates
+stay the same.
 For more iterations, restore the run's settings, replay and accepted model:
 
 ```powershell
@@ -449,7 +484,8 @@ For more iterations, restore the run's settings, replay and accepted model:
 A new run requires a new output directory. `--checkpoint MODEL` starts from an
 existing network, including its optimizer history, rather than initializing
 weights again. Its board dimensions must match self-play; it supplies the
-architecture. Resume accepts only `--iterations`; to change settings, start a
+architecture. Resume accepts `--iterations` and the optional `--live` display
+flag; to change learning settings, start a
 new output directory with the desired checkpoint. Each iteration uses recorded
 separate seeds for game sampling, minibatches and arena identities. Checkpoint
 and replay fingerprints detect changed committed inputs; they are content
