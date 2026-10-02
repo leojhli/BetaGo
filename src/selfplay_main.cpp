@@ -322,7 +322,7 @@ int main(int argc, char** argv) {
         if (args.has("--live")) {
             live.enable(root);
             live.publish(GameState::new_game(settings.play.board_size, settings.play.komi), PASS, 0,
-                {{"phase", "self_play"}, {"message", "Preparing self-play"}, {"iteration", first},
+                {{"phase", "self_play"}, {"message", "Preparing BetaGo self-play (both colors)"}, {"iteration", first},
                  {"game", 0}, {"games_total", settings.games}});
         }
         std::cout << std::fixed << std::setprecision(5);
@@ -338,11 +338,11 @@ int main(int argc, char** argv) {
                 SelfPlayMoveProgress live_moves;
                 if (live.enabled()) {
                     live.publish(GameState::new_game(settings.play.board_size, settings.play.komi), PASS, 0,
-                        {{"phase", "self_play"}, {"message", "Self-play game started"}, {"iteration", iteration},
+                        {{"phase", "self_play"}, {"message", "BetaGo plays both Black and White"}, {"iteration", iteration},
                          {"game", game + 1}, {"games_total", settings.games}});
                     live_moves = [&](int move_number, const GameState& state, Move move) {
                         if (live.enabled()) live.publish(state, move, move_number,
-                            {{"phase", "self_play"}, {"message", "Self-play"}, {"iteration", iteration},
+                            {{"phase", "self_play"}, {"message", "BetaGo plays both Black and White"}, {"iteration", iteration},
                              {"game", game + 1}, {"games_total", settings.games}});
                     };
                 }
@@ -351,7 +351,7 @@ int main(int argc, char** argv) {
                         if (move % 25 == 0) std::cout << "  Game " << game + 1 << ": move " << move << '\n' << std::flush;
                     }, live_moves);
                 if (live.enabled()) live.stage({{"phase", "self_play"},
-                    {"message", result.record.at("termination_reason") == "two_passes" ? "Self-play game completed" : "Self-play game truncated"},
+                    {"message", result.record.at("termination_reason") == "two_passes" ? "BetaGo self-play completed (both colors)" : "BetaGo self-play truncated (both colors)"},
                     {"iteration", iteration}, {"game", game + 1}, {"games_total", settings.games}});
                 if (replay.add(result.record)) ++completed;
                 games.push_back(std::move(result.record));
@@ -372,12 +372,12 @@ int main(int argc, char** argv) {
                 std::cout << "  No completed games: no value labels or training update.\n";
             } else {
                 auto candidate = incumbent;
-                if (live.enabled()) live.stage({{"phase", "training"}, {"message", "Training candidate"},
+                if (live.enabled()) live.stage({{"phase", "training"}, {"message", "Training BetaGo candidate; no game in progress"},
                     {"iteration", iteration}, {"update", 0}, {"updates_total", settings.training.updates}});
                 report["training"] = train_candidate(candidate, replay, settings.training,
                     iteration_seed(settings.seed, iteration, UINT64_C(0x100000000)),
                     [&](int update, const LossMetrics& loss) {
-                        if (live.enabled()) live.stage({{"phase", "training"}, {"message", "Training candidate"},
+                        if (live.enabled()) live.stage({{"phase", "training"}, {"message", "Training BetaGo candidate; no game in progress"},
                             {"iteration", iteration}, {"update", update}, {"updates_total", settings.training.updates},
                             {"policy_loss", loss.policy}, {"value_loss", loss.value}, {"total_loss", loss.total}});
                         if (update == 1 || update % 25 == 0 || update == settings.training.updates)
@@ -392,18 +392,23 @@ int main(int argc, char** argv) {
                 // Reserve ample positive headroom for arena's pair seed arithmetic.
                 arena.seed = static_cast<std::int64_t>(static_cast<std::uint64_t>(iteration_seed(settings.seed, iteration, UINT64_C(0x200000000))) & UINT64_C(0x3fffffffffffffff));
                 ArenaMoveProgress live_evaluation;
+                // Arena pairs alternate colors, starting with candidate A as Black.
+                const auto matchup = [](int game) -> std::string {
+                    return game % 2 == 0 ? "Black: BetaGo candidate | White: BetaGo accepted"
+                                         : "Black: BetaGo accepted | White: BetaGo candidate";
+                };
                 if (live.enabled()) {
-                    live.stage({{"phase", "evaluation"}, {"message", "Evaluating candidate against incumbent"},
+                    live.stage({{"phase", "evaluation"}, {"message", "Preparing BetaGo candidate vs accepted model"},
                         {"iteration", iteration}, {"game", 0}, {"games_total", settings.evaluation_pairs * 2}});
                     live_evaluation = [&](int game, const GameState& state, Move move, int move_number) {
                         if (live.enabled()) live.publish(state, move, move_number,
-                            {{"phase", "evaluation"}, {"message", "Candidate evaluation"}, {"iteration", iteration},
+                            {{"phase", "evaluation"}, {"message", matchup(game)}, {"iteration", iteration},
                              {"game", game + 1}, {"games_total", settings.evaluation_pairs * 2}});
                     };
                 }
                 auto evaluation = run_arena(arena, metadata(), [&](int game, const Json& record) {
                     if (live.enabled()) live.stage({{"phase", "evaluation"},
-                        {"message", record.at("termination_reason") == "two_passes" ? "Evaluation game completed" : "Evaluation game truncated"},
+                        {"message", matchup(game) + (record.at("termination_reason") == "two_passes" ? " - completed" : " - truncated")},
                         {"iteration", iteration}, {"game", game + 1}, {"games_total", settings.evaluation_pairs * 2}});
                     std::cout << "  Evaluation " << game + 1 << ": " << record.at("termination_reason") << '\n' << std::flush;
                 }, {}, {}, live_evaluation);

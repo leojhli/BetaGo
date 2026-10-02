@@ -155,7 +155,8 @@ int main(int argc, char** argv) {
             };
             const auto corpus = generate_teacher_games(configuration, settings,
                 [&](int game, const GameState& state, Move move, int count) {
-                    live.publish(state, move, count, {{"phase", "self_play"}, {"message", "External teacher game"},
+                    live.publish(state, move, count, {{"phase", "self_play"},
+                        {"message", "External teacher: " + configuration.display_name + " (both Black and White)"},
                         {"game", game + 1}, {"games_total", settings.games}});
                     if (count % 20 == 0) std::cout << "Teacher game " << game + 1 << '/' << settings.games << ", move " << count << '\n' << std::flush;
                 }, save);
@@ -217,7 +218,7 @@ int main(int argc, char** argv) {
         if (!std::filesystem::create_directories(output)) throw std::invalid_argument("Output was created by another process");
         if (args.has("--live")) {
             live.enable(live_path, games.front().initial_state);
-            live.stage({{"phase", "training"}, {"message", "Preparing whole-game split and supervised targets"}});
+            live.stage({{"phase", "training"}, {"message", "Preparing BetaGo training from recorded games; no game in progress"}});
         }
         const auto checkpoint = args.has("--checkpoint") ? std::optional<Path>(args.text("--checkpoint")) : std::nullopt;
         const Json input_identity{{"path", corpus_path.string()}, {"fingerprint_fnv1a64", fingerprint(bytes)},
@@ -227,7 +228,7 @@ int main(int argc, char** argv) {
             snapshot["build_machine"] = build; snapshot["input_corpus"] = input_identity;
             save_records_atomic(output / "report.json", snapshot);
             std::cout << "Supervised epoch " << epoch << '/' << settings.epochs << ": " << metrics.dump() << '\n' << std::flush;
-            live.stage({{"phase", "training"}, {"message", "Supervised pretraining epoch " + std::to_string(epoch)},
+            live.stage({{"phase", "training"}, {"message", "Training BetaGo from recorded games; no game in progress"},
                 {"update", epoch}, {"updates_total", settings.epochs},
                 {"policy_loss", metrics.at("training").at("policy_cross_entropy")},
                 {"value_loss", metrics.at("training").at("value_mse")},
